@@ -21,6 +21,7 @@
     session_token     String?  @unique
     created_at        DateTime @default(now())
     updated_at        DateTime @updatedAt
+    affiliate_code String? @unique
   }
 
   model app_config {
@@ -133,4 +134,14 @@ model campaign_attachments {
   phone     String   @unique
   reason    String?  // "optout", "bounce", "manual"
   createdAt DateTime @default(now())
+}
+
+model openai_config {
+  id        String   @id @default(uuid())
+  owner_id  String   // o user_id
+  api_key   String   // encriptada con bcrypt o AES
+  model     String   @default("gpt-4o-mini")
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }

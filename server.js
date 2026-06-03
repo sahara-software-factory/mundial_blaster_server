@@ -88,6 +88,91 @@ function resolveSpintax(text) {
   })
 }
 
+
+// ============================================================
+// TIER LIMITS
+// ============================================================
+const TIER_LIMITS = {
+  starter: {
+    maxLines: 2,
+    maxTemplates: 5,
+    maxPendingCampaigns: 10,
+    hasBlacklist: false,
+    hasAdvancedReports: false,
+    hasCron: false,
+    hasExport: false,
+    hasRoundRobin: false,
+    hasHumanMode: false,
+    hasClone: false,
+    hasAdvancedSpintax: false,
+    hasTemplateVars: false,
+    hasAI: false,
+    hasMultiUser: false,
+  },
+  pro: {
+    maxLines: 5,
+    maxTemplates: Infinity,
+    maxPendingCampaigns: 50,
+    hasBlacklist: true,
+    hasAdvancedReports: true,
+    hasCron: true,
+    hasExport: true,
+    hasRoundRobin: true,
+    hasHumanMode: true,
+    hasClone: true,
+    hasAdvancedSpintax: true,
+    hasTemplateVars: true,
+    hasAI: false,
+    hasMultiUser: false,
+  },
+  business: {
+    maxLines: Infinity,
+    maxTemplates: Infinity,
+    maxPendingCampaigns: Infinity,
+    hasBlacklist: true,
+    hasAdvancedReports: true,
+    hasCron: true,
+    hasExport: true,
+    hasRoundRobin: true,
+    hasHumanMode: true,
+    hasClone: true,
+    hasAdvancedSpintax: true,
+    hasTemplateVars: true,
+    hasAI: true,
+    hasMultiUser: true,
+  },
+}
+
+async function getAppTier() {
+  try {
+    const config = await prisma.app_config.findUnique({ where: { key: 'license' } })
+    if (!config?.value) return 'starter'
+    const license = validateLicense(config.value)
+    return license?.tier || 'starter'
+  } catch {
+    return 'starter'
+  }
+}
+
+async function loadTier(req, res, next) {
+  const tier = await getAppTier()
+  req.tier = tier
+  req.tierConfig = TIER_LIMITS[tier] || TIER_LIMITS.starter
+  next()
+}
+
+function requireFeature(feature) {
+  return (req, res, next) => {
+    if (!req.tierConfig?.[feature]) {
+      return res.status(403).json({
+        error: `Esta función requiere un plan superior. Tu plan actual: ${req.tier}.`,
+        tier: req.tier,
+      })
+    }
+    next()
+  }
+}
+
 // ============================================================
 // MIDDLEWARES
 // ============================================================
@@ -586,11 +671,31 @@ app.delete('/api/tags/:id', authOrSecret, async (req, res) => {
 
 // ========== REPORTES / CAMPAÑAS HISTÓRICO ==========
 
-app.get('/api/campaigns/report', authOrSecret, async (req, res) => {
+app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
   try {
-    const { period } = req.query // '7d', '30d', 'all'
+    const { period } = req.query
     
     let dateFilter = {}
+    
+    // Starter: siempre 30 días, ignora el query param
+    if (req.tier === 'starter') {
+      dateFilter = { created_at: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } }
+    } else {
+      // Pro y Business: respetan el period
+      if (period === '7d') {
+        dateFilter = { created_at: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } }
+      } else if (period === '30d') {
+        dateFilter = { created_at: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } }
+      } else if (period === '90d') {
+        dateFilter = { created_at: { gte: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) } }
+      } else if (period === 'all') {
+        dateFilter = {}
+      } else {
+        dateFilter = { created_at: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } }
+      }
+    }
+    
+   
     if (period === '7d') {
       dateFilter = { created_at: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } }
     } else if (period === '30d') {
@@ -746,7 +851,7 @@ app.get('/api/campaigns/:id/logs', authOrSecret, requireLicense, async (req, res
 })
 
 // Repetir campaña (Pro)
-app.post('/api/campaigns/:id/clone', authOrSecret, async (req, res) => {
+app.post('/api/campaigns/:id/clone', authOrSecret, loadTier, requireFeature('hasClone'), async (req, res) => {
   try {
     const original = await prisma.campaigns.findUnique({ where: { id: req.params.id } })
     if (!original) return res.status(404).json({ error: 'Campaña no encontrada' })
@@ -825,7 +930,7 @@ app.delete('/api/campaigns/:id', authOrSecret, requireLicense, async (req, res) 
 
 
 
-app.get('/api/campaigns/:id/export', authOrSecret, async (req, res) => {
+app.get('/api/campaigns/:id/export', authOrSecret, loadTier, requireFeature('hasExport'), async (req, res) => {
   try {
     const { id } = req.params
 
@@ -970,9 +1075,19 @@ app.get('/api/templates', authOrSecret, async (req, res) => {
   }
 })
 
-app.post('/api/templates', authOrSecret, async (req, res) => {
+app.post('/api/templates', authOrSecret, loadTier, async (req, res) => {
   const { name, content, category } = req.body
   if (!name || !content) return res.status(400).json({ error: 'Nombre y contenido requeridos' })
+
+  const currentTemplates = await prisma.message_templates.count()
+  if (currentTemplates >= req.tierConfig.maxTemplates) {
+    return res.status(403).json({
+      error: `Límite alcanzado: tu plan ${req.tier} permite ${req.tierConfig.maxTemplates} template(s).`,
+      current: currentTemplates,
+      max: req.tierConfig.maxTemplates,
+      tier: req.tier,
+    })
+  }
   
   // Extraer variables automáticamente: {{variable}}
   const variables = [...content.matchAll(/\{\{(\w+)\}\}/g)].map(m => m[1])
@@ -1099,18 +1214,19 @@ app.get('/api/lineas', authOrSecret, requireLicense, async (req, res) => {
   }
 })
 
-app.post('/api/lineas', authOrSecret, requireLicense, async (req, res) => {
+app.post('/api/lineas', authOrSecret, requireLicense, loadTier, async (req, res) => {
   const { phone, nombre } = req.body
   if (!phone) return res.status(400).json({ error: 'phone required' })
 
   try {
     const activeLines = await prisma.lineas_whatsapp.count()
 
-    if (activeLines >= req.license.maxLines) {
+    if (activeLines >= req.tierConfig.maxLines) {
       return res.status(403).json({
-        error: `Límite alcanzado: tu licencia ${req.license.tier} permite ${req.license.maxLines} línea(s).`,
+        error: `Límite alcanzado: tu plan ${req.tier} permite ${req.tierConfig.maxLines} línea(s).`,
         current: activeLines,
-        max: req.license.maxLines
+        max: req.tierConfig.maxLines,
+        tier: req.tier,
       })
     }
 
@@ -1143,7 +1259,7 @@ app.post('/api/lineas/logout', authOrSecret, requireLicense, async (req, res) =>
 })
 
 // ========== CAMPAÑAS ==========
-app.post('/api/campaigns/send', authOrSecret, requireLicense, async (req, res) => {
+app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (req, res) => {
   try {
     const body = req.body
 
@@ -1171,11 +1287,44 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, async (req, res) =
       })
     }
 
-    // ─── MODO ───
+      // ─── MODO ───
     const distributionMode = body.distribution_mode || 'single'
-    const isRoundRobin = distributionMode === 'round_robin' && lineasSeleccionadas.length > 1
-      const isPending = body.schedule === 'pending'
+    const isPending = body.schedule === 'pending'
     const isScheduled = body.schedule === 'scheduled' && body.execute_at
+
+    // ─── VALIDACIONES TIER ───
+    if (isPending) {
+      const pendingCount = await prisma.campaigns.count({ where: { status: 'pending' } })
+      if (pendingCount >= req.tierConfig.maxPendingCampaigns) {
+        return res.status(403).json({
+          error: `Límite alcanzado: tu plan ${req.tier} permite ${req.tierConfig.maxPendingCampaigns} campaña(s) pendiente(s).`,
+          current: pendingCount,
+          max: req.tierConfig.maxPendingCampaigns,
+          tier: req.tier,
+        })
+      }
+    }
+
+    if (isScheduled && !req.tierConfig.hasCron) {
+      return res.status(403).json({
+        error: 'Programación de campañas disponible solo en plan Pro y Business.',
+        tier: req.tier,
+      })
+    }
+
+    if (isRoundRobin && !req.tierConfig.hasRoundRobin) {
+      return res.status(403).json({
+        error: 'Rotación Round-Robin disponible solo en plan Pro y Business.',
+        tier: req.tier,
+      })
+    }
+
+    if (body.human_mode && !req.tierConfig.hasHumanMode) {
+      return res.status(403).json({
+        error: 'Modo humano disponible solo en plan Pro y Business.',
+        tier: req.tier,
+      })
+    }
 
     const newCampaign = await prisma.campaigns.create({
       data: {
@@ -1351,12 +1500,11 @@ app.post('/api/campaigns/:id/start', authOrSecret, async (req, res) => {
 
     // Disparar fire & forget
         // Disparar fire & forget (delay mínimo 5s para no parecer spam)
-    waService.sendCampaign(campaign.id, lineasSeleccionadas, targets, campaign.message, {
+         waService.sendCampaign(campaign.id, lineasSeleccionadas, targets, campaign.message, {
       delayMin: 5000,
       delayMax: 12000,
       imageUrl: campaign.image_url,
-      humanMode: campaign.human_mode === true  // ← NUEVO: lee de DB
-       
+      humanMode: campaign.human_mode === true
     }).catch(console.error)
 
     res.json({ success: true, campaignId: campaign.id, status: 'running' })
@@ -1515,6 +1663,79 @@ app.post('/api/admin/reset-user', authMiddleware, async (req, res) => {
   }
 })
 
+
+// ========== BLACKLIST ==========
+// Solo Pro y Business
+
+app.get('/api/blacklist', authOrSecret, loadTier, requireFeature('hasBlacklist'), async (req, res) => {
+  try {
+    const list = await prisma.blacklist.findMany({ orderBy: { createdAt: 'desc' } })
+    res.json({ blacklist: list })
+  } catch (e) {
+    res.status(500).json({ error: 'Error listando blacklist' })
+  }
+})
+
+app.post('/api/blacklist', authOrSecret, loadTier, requireFeature('hasBlacklist'), async (req, res) => {
+  const { phone, reason } = req.body
+  if (!phone) return res.status(400).json({ error: 'Teléfono requerido' })
+  
+  try {
+    const entry = await prisma.blacklist.upsert({
+      where: { phone: phone.replace(/\D/g, '') },
+      update: { reason: reason || 'manual' },
+      create: { phone: phone.replace(/\D/g, ''), reason: reason || 'manual' }
+    })
+    res.json({ success: true, entry })
+  } catch (e) {
+    res.status(500).json({ error: 'Error agregando a blacklist' })
+  }
+})
+
+app.delete('/api/blacklist/:phone', authOrSecret, loadTier, requireFeature('hasBlacklist'), async (req, res) => {
+  try {
+    await prisma.blacklist.delete({ where: { phone: req.params.phone.replace(/\D/g, '') } })
+    res.json({ success: true })
+  } catch (e) {
+    res.status(500).json({ error: 'Error eliminando de blacklist' })
+  }
+})
+
+// Generar código de afiliado
+app.post('/api/affiliate/generate', requireAuth, async (req, res) => {
+  try {
+    // Verificar si ya tiene código
+    if (req.user.affiliate_code) {
+      return res.status(409).json({ error: 'Ya tenés un código generado', code: req.user.affiliate_code })
+    }
+
+    const generateCode = () => {
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+      let result = ''
+      for (let i = 0; i < 6; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length))
+      }
+      return `WS-${result}`
+    }
+
+    let code = generateCode()
+    let attempts = 0
+    // Asegurar unicidad
+    while (await prisma.usuarios.findUnique({ where: { affiliate_code: code } }) && attempts < 10) {
+      code = generateCode()
+      attempts++
+    }
+
+    const updated = await prisma.usuarios.update({
+      where: { id: req.user.id },
+      data: { affiliate_code: code }
+    })
+
+    res.json({ success: true, code: updated.affiliate_code })
+  } catch (e) {
+    res.status(500).json({ error: 'Error generando código' })
+  }
+})
 
 // CRON
 
