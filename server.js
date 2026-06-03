@@ -1740,13 +1740,17 @@ app.post('/api/affiliate/generate', requireAuth, async (req, res) => {
 
 // CRON
 
-cron.schedule('* * * * *', async () => {
+cron.schedule('*/5 * * * *', async () => {
   try {
         const now = new Date()
+        const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000)
     const pending = await prisma.scheduled_campaigns.findMany({
       where: {
         status: 'pending',
-        execute_at: { lte: now }
+        execute_at: { 
+          lte: now,
+          gte: oneHourAgo // ← Solo las últimas 1 hora, no viejas eternas
+        }
       },
       orderBy: { execute_at: 'asc' }
     })
