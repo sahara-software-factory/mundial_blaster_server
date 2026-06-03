@@ -416,6 +416,7 @@ app.patch('/api/auth/me', requireLicense, requireAuth, async (req, res) => {
 
     if (nombre) updateData.nombre = nombre
     if (avatar) updateData.avatar = avatar
+    if (req.body.affiliate_code) updateData.affiliate_code = req.body.affiliate_code
 
     // Cambio de email: requiere password actual
     if (email && email !== req.user.email) {

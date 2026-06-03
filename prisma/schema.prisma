@@ -21,7 +21,7 @@
     session_token     String?  @unique
     created_at        DateTime @default(now())
     updated_at        DateTime @updatedAt
-    affiliate_code String? @unique
+    affiliate_code    String?  @unique
   }
 
   model app_config {
