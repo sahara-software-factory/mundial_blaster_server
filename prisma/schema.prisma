@@ -8,21 +8,30 @@
   }
 
 
-  model usuarios {
-    id                String   @id @default(uuid())
-    nombre            String
-    email             String   @unique
-    password          String   // bcrypt hash
-    avatar            String   @default("avatar1")
-    role              String   @default("admin") // admin | user
-    security_question String?
-    security_answer   String?  // bcrypt hash de la respuesta
-    last_login        DateTime?
-    session_token     String?  @unique
-    created_at        DateTime @default(now())
-    updated_at        DateTime @updatedAt
-    affiliate_code    String?  @unique
-  }
+model usuarios {
+  id                   String   @id @default(uuid())
+  nombre               String
+  email                String   @unique
+  password             String   // bcrypt hash
+  avatar               String   @default("avatar1")
+  role                 String   @default("admin") // admin | user
+  security_question    String?
+  security_answer      String?  // bcrypt hash de la respuesta
+  last_login           DateTime?
+  session_token        String?  @unique
+  created_at           DateTime @default(now())
+  updated_at           DateTime @updatedAt
+  affiliate_code       String?  @unique
+
+  // ── ONBOARDING V2 ──
+  company_name         String?
+  phone                String?  // teléfono del admin/empresa
+  timezone             String   @default("America/Argentina/Buenos_Aires")
+  language             String   @default("es")
+  industry             String?  // e-commerce | servicios | educacion | salud | otro
+  expected_volume      String?  // 0-500 | 500-2000 | 2000-10000 | 10000+
+  onboarding_completed Boolean  @default(false)
+}
 
   model app_config {
     key   String @id
