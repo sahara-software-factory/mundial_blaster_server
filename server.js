@@ -291,13 +291,13 @@ app.post('/api/auth/register', requireLicense, async (req, res) => {
         security_question: security_question || null,
         security_answer: hashedSecurity,
         last_login: new Date(),
-          company_name: company_name || null,
-  phone: phone || null,
-  timezone: timezone || 'America/Argentina/Buenos_Aires',
-  language: language || 'es',
-  industry: industry || null,
-  expected_volume: expected_volume || null,
-  onboarding_completed: true,
+        company_name: company_name || null,
+        phone: phone || null,
+        timezone: timezone || 'America/Argentina/Buenos_Aires',
+        language: language || 'es',
+        industry: industry || null,
+        expected_volume: expected_volume || null,
+        onboarding_completed: true,
       }
     })
 
@@ -320,7 +320,7 @@ app.post('/api/auth/register', requireLicense, async (req, res) => {
       success: true,
       token,
       user: safeUser,
-      message: 'Registro exitoso. Bienvenido a Mundial Blaster.'
+      message: 'Registro exitoso. Bienvenido a WabiSend.'
     })
 
   } catch (e) {
@@ -707,11 +707,7 @@ app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
     }
     
    
-    if (period === '7d') {
-      dateFilter = { created_at: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } }
-    } else if (period === '30d') {
-      dateFilter = { created_at: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } }
-    }
+    
     
     const campaigns = await prisma.campaigns.findMany({
       where: dateFilter,
@@ -867,13 +863,7 @@ app.post('/api/campaigns/:id/clone', authOrSecret, loadTier, requireFeature('has
     const original = await prisma.campaigns.findUnique({ where: { id: req.params.id } })
     if (!original) return res.status(404).json({ error: 'Campaña no encontrada' })
 
-    // LOG DEBUG
-    console.log('📋 Original campaign:', { 
-      id: original.id, 
-      name: original.name, 
-      hasTargets: !!original.targets,
-      targetsCount: original.targets?.length || 0 
-    })
+ 
 
     const newId = `camp_${Date.now()}`
         await prisma.campaigns.create({
@@ -890,7 +880,7 @@ app.post('/api/campaigns/:id/clone', authOrSecret, loadTier, requireFeature('has
         targets: original.targets,
         distribution_mode: original.distribution_mode || 'single',
         selected_lines: original.selected_lines,
-        human_mode: original.human_mode || false  // ← NUEVO
+        human_mode: original.human_mode || false  
       }
     })
 
@@ -1302,6 +1292,7 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
     const distributionMode = body.distribution_mode || 'single'
     const isPending = body.schedule === 'pending'
     const isScheduled = body.schedule === 'scheduled' && body.execute_at
+    const isRoundRobin = body.distribution_mode === 'round_robin'
 
     // ─── VALIDACIONES TIER ───
     if (isPending) {
@@ -1351,12 +1342,11 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
         distribution_mode: isRoundRobin ? 'round_robin' : 'single',
         line_id: lineasSeleccionadas[0]?.id || '',
         selected_lines: JSON.stringify(lineasSeleccionadas.map(l => l.id)),
-        human_mode: body.human_mode === true  // ← NUEVO
+        human_mode: body.human_mode === true  
       }
     })
 
-    // ─── GUARDAR PARA DESPUÉS: solo responder, no disparar ───
-        // ─── GUARDAR PARA DESPUÉS (manual) ───
+   
     if (isPending) {
       return res.status(201).json({
         success: true,
@@ -1413,7 +1403,7 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       delayMin: body.delay_min || 8000,
       delayMax: body.delay_max || 15000,
       imageUrl: body.image_url || null,
-      humanMode: body.human_mode === true  // ← NUEVO
+      humanMode: body.human_mode === true  
     }
 
     waService.sendCampaign(newCampaign.id, lineasSeleccionadas, body.targets, body.message.trim(), sendOptions)
@@ -1832,7 +1822,7 @@ cron.schedule('*/5 * * * *', async () => {
 // ============================================================
 // SERVER START
 // ============================================================
-server.listen(PORT, () => console.log(`🚀 Mundial Blaster v2.0.0 en puerto ${PORT}`))
+server.listen(PORT, () => console.log(`🚀 WabiSend v2.0.0 en puerto ${PORT}`))
 
 process.on('uncaughtException', (err) => console.error('🔥 Uncaught:', err))
 process.on('unhandledRejection', (reason) => console.error('🔥 Unhandled:', reason))
