@@ -261,7 +261,7 @@ app.get('/', (_, res) => res.json({ status: 'OK', service: 'Mundial Blaster', ve
 app.post('/api/auth/register', requireLicense, async (req, res) => {
   const { nombre, email, password, confirmPassword, avatar, 
   security_question, security_answer, line_phone, line_name,
-  company_name, phone, timezone, language, industry, expected_volume } = req.body
+  company_name, phone, timezone, language, industry, expected_volume, affiliate_code } = req.body
 
   if (!nombre || !email || !password) {
     return res.status(400).json({ error: 'Nombre, email y contraseña son requeridos' })
@@ -292,6 +292,7 @@ app.post('/api/auth/register', requireLicense, async (req, res) => {
         security_answer: hashedSecurity,
         last_login: new Date(),
         company_name: company_name || null,
+        affiliate_code: affiliate_code || null,
         phone: phone || null,
         timezone: timezone || 'America/Argentina/Buenos_Aires',
         language: language || 'es',
