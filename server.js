@@ -452,11 +452,7 @@ app.post('/api/auth/recover', requireLicense, async (req, res) => {
 
 // Get usuario actual
 app.get('/api/auth/me', requireLicense, requireAuth, async (req, res) => {
-  const adminEmail = await prisma.app_config.findUnique({ where: { key: 'admin_email' }})
-if (email && email !== adminEmail.value) {
-  // Requiere verificación extra, o directamente bloquear
-}
-  const { password, security_answer, ...safeUser } = req.user
+  const { password, security_answer, recovery_code, reset_token, ...safeUser } = req.user
   res.json({ user: safeUser })
 })
 
@@ -1571,42 +1567,50 @@ app.post('/api/campaigns/:id/start', authOrSecret, async (req, res) => {
 })
 
 app.post('/api/setup/activate', async (req, res) => {
-  const existingUser = await prisma.usuarios.findFirst()
+  try {
+    // 🔒 Si ya existe usuario, no permitir re-setup
+    const existingUser = await prisma.usuarios.findFirst()
     if (existingUser) {
       return res.status(403).json({ error: 'Usuario ya registrado. Usá /login o recuperación.' })
     }
-  const { licenseKey } = req.body
-  if (!licenseKey) return res.status(400).json({ error: 'licenseKey required' })
 
-  const license = validateLicense(licenseKey)
-  if (!license) return res.status(400).json({ error: 'Licencia inválida' })
+    const { licenseKey } = req.body
+    if (!licenseKey) return res.status(400).json({ error: 'licenseKey required' })
 
-  // Anti-clonación: verificar dominio
-  const instanceDomain = process.env.RAILWAY_STATIC_URL ||
-                         process.env.VERCEL_URL ||
-                         req.headers.host
+    const license = validateLicense(licenseKey)
+    if (!license) return res.status(400).json({ error: 'Licencia inválida' })
 
-  if (license.domain && license.domain !== instanceDomain) {
-    return res.status(403).json({
-      error: 'Licencia no válida para este dominio',
-      licensedDomain: license.domain,
-      currentDomain: instanceDomain
+    // Anti-clonación: verificar dominio
+    const instanceDomain = process.env.RAILWAY_STATIC_URL ||
+                           process.env.VERCEL_URL ||
+                           req.headers.host
+
+    if (license.domain && license.domain !== instanceDomain) {
+      return res.status(403).json({
+        error: 'Licencia no válida para este dominio',
+        licensedDomain: license.domain,
+        currentDomain: instanceDomain
+      })
+    }
+
+    await prisma.app_config.upsert({
+      where: { key: 'license' },
+      update: { value: licenseKey },
+      create: { key: 'license', value: licenseKey }
     })
+
+    await prisma.app_config.upsert({
+      where: { key: 'instance_domain' },
+      update: { value: instanceDomain },
+      create: { key: 'instance_domain', value: instanceDomain }
+    })
+
+    res.json({ success: true, tier: license.tier, features: license })
+
+  } catch (e) {
+    console.error('Setup activate error:', e)
+    res.status(500).json({ error: 'Error activando licencia' })
   }
-
-  await prisma.app_config.upsert({
-    where: { key: 'license' },
-    update: { value: licenseKey },
-    create: { key: 'license', value: licenseKey }
-  })
-
-  await prisma.app_config.upsert({
-    where: { key: 'instance_domain' },
-    update: { value: instanceDomain },
-    create: { key: 'instance_domain', value: instanceDomain }
-  })
-
-  res.json({ success: true, tier: license.tier, features: license })
 })
 
 app.get('/api/license/status', async (req, res) => {
