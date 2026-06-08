@@ -259,74 +259,96 @@ app.get('/', (_, res) => res.json({ status: 'OK', service: 'Mundial Blaster', ve
 
 // Registro (onboarding)
 app.post('/api/auth/register', requireLicense, async (req, res) => {
-  const { nombre, email, password, confirmPassword, avatar, 
-  security_question, security_answer, line_phone, line_name,
-  company_name, phone, timezone, language, industry, expected_volume, affiliate_code } = req.body
-
-  if (!nombre || !email || !password) {
-    return res.status(400).json({ error: 'Nombre, email y contraseña son requeridos' })
-  }
-  if (password !== confirmPassword) {
-    return res.status(400).json({ error: 'Las contraseñas no coinciden' })
-  }
-  if (password.length < 6) {
-    return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' })
-  }
-
   try {
-    const existing = await prisma.usuarios.findUnique({ where: { email: email.toLowerCase().trim() } })
-    if (existing) {
-      return res.status(409).json({ error: 'Ya existe un usuario registrado. Usá el login.' })
+    // 🔒 BLINDAJE: Solo un admin por instancia
+    const existingCount = await prisma.usuarios.count()
+    if (existingCount > 0) {
+      return res.status(403).json({ 
+        error: 'Ya existe un administrador en esta instancia. Usá recuperación de contraseña o contactá soporte.' 
+      })
+    }
+
+    const { 
+      nombre, email, password, confirmPassword, avatar,
+      security_question, security_answer,
+      company_name, phone, timezone, language, industry, expected_volume,
+      line_phone, line_name,
+      recovery_code // ← NUEVO
+    } = req.body
+
+    if (!nombre || !email || !password || !security_question || !security_answer) {
+      return res.status(400).json({ error: 'Faltan campos obligatorios' })
+    }
+    if (password !== confirmPassword) {
+      return res.status(400).json({ error: 'Las contraseñas no coinciden' })
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Mínimo 6 caracteres' })
     }
 
     const hashedPassword = await bcrypt.hash(password, 10)
-    const hashedSecurity = security_answer ? await bcrypt.hash(security_answer, 10) : null
+    const hashedAnswer = await bcrypt.hash(security_answer.toLowerCase().trim(), 10)
+    
+    // Hash del código de recuperación (si viene)
+    let hashedRecovery = null
+    if (recovery_code) {
+      hashedRecovery = await bcrypt.hash(recovery_code.toUpperCase().trim(), 10)
+    }
 
-    const user = await prisma.usuarios.create({
+    const newUser = await prisma.usuarios.create({
       data: {
         nombre,
         email: email.toLowerCase().trim(),
         password: hashedPassword,
-        avatar: avatar || 'avatar1',
-        security_question: security_question || null,
-        security_answer: hashedSecurity,
-        last_login: new Date(),
-        company_name: company_name || null,
-        affiliate_code: affiliate_code || null,
-        phone: phone || null,
+        avatar: avatar || 'Felix',
+        security_question,
+        security_answer: hashedAnswer,
+        company_name,
+        phone,
         timezone: timezone || 'America/Argentina/Buenos_Aires',
         language: language || 'es',
-        industry: industry || null,
-        expected_volume: expected_volume || null,
+        industry,
+        expected_volume,
         onboarding_completed: true,
+        recovery_code: hashedRecovery,
       }
     })
 
-    // Crear línea opcional desde onboarding
-    if (line_phone) {
-      await prisma.lineas_whatsapp.create({
-        data: {
-          phone: line_phone.replace(/\D/g, ''),
-          nombre: line_name || nombre + ' - Línea 1',
-          status: 'DESCONECTADA'
-        }
-      }).catch(() => {})
-    }
+    // 🔥 RECLAIM: Si hay datos huérfanos (owner_id = null), asignarlos al nuevo admin
+    await prisma.$transaction([
+      prisma.campaigns.updateMany({ where: { owner_id: null }, data: { owner_id: newUser.id } }),
+      prisma.lineas_whatsapp.updateMany({ where: { owner_id: null }, data: { owner_id: newUser.id } }),
+      prisma.contacts.updateMany({ where: { owner_id: null }, data: { owner_id: newUser.id } }),
+      prisma.tags.updateMany({ where: { owner_id: null }, data: { owner_id: newUser.id } }),
+      prisma.message_templates.updateMany({ where: { owner_id: null }, data: { owner_id: newUser.id } }),
+      prisma.campaign_logs.updateMany({ where: { owner_id: null }, data: { owner_id: newUser.id } }),
+      prisma.scheduled_campaigns.updateMany({ where: { owner_id: null }, data: { owner_id: newUser.id } }),
+      prisma.campaign_attachments.updateMany({ where: { owner_id: null }, data: { owner_id: newUser.id } }),
+      prisma.blacklist.updateMany({ where: { owner_id: null }, data: { owner_id: newUser.id } }),
+    ])
 
-    const token = generateToken({ userId: user.id, email: user.email, role: user.role })
-
-    const { password: _, security_answer: __, ...safeUser } = user
-
-    res.json({
-      success: true,
-      token,
-      user: safeUser,
-      message: 'Registro exitoso. Bienvenido a WabiSend.'
+    // Guardar admin_email en app_config para referencia
+    await prisma.app_config.upsert({
+      where: { key: 'admin_email' },
+      update: { value: email.toLowerCase().trim() },
+      create: { key: 'admin_email', value: email.toLowerCase().trim() }
     })
 
+    const token = jwt.sign(
+      { userId: newUser.id, email: newUser.email, role: newUser.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '8h' }
+    )
+
+    const { password: pwd, security_answer: sa, recovery_code: rc, ...safeUser } = newUser
+    res.json({ success: true, token, user: safeUser })
+
   } catch (e) {
-    console.error('Error registro:', e)
-    res.status(500).json({ error: 'Error creando usuario' })
+    console.error('Register error:', e)
+    if (e.code === 'P2002') {
+      return res.status(409).json({ error: 'Ese email ya está registrado' })
+    }
+    res.status(500).json({ error: 'Error creando cuenta' })
   }
 })
 
@@ -373,12 +395,14 @@ app.post('/api/auth/login', requireLicense, async (req, res) => {
   }
 })
 
+
+
 // Recuperar contraseña por pregunta de seguridad
 app.post('/api/auth/recover', requireLicense, async (req, res) => {
-  const { email, security_answer, new_password } = req.body
+  const { email, new_password, security_answer, recovery_code } = req.body
 
-  if (!email || !security_answer || !new_password) {
-    return res.status(400).json({ error: 'Faltan datos' })
+  if (!email || !new_password) {
+    return res.status(400).json({ error: 'Email y nueva contraseña requeridos' })
   }
   if (new_password.length < 6) {
     return res.status(400).json({ error: 'Mínimo 6 caracteres' })
@@ -389,13 +413,24 @@ app.post('/api/auth/recover', requireLicense, async (req, res) => {
       where: { email: email.toLowerCase().trim() }
     })
 
-    if (!user || !user.security_answer) {
-      return res.status(404).json({ error: 'Usuario no encontrado o sin pregunta de seguridad configurada' })
+    if (!user) {
+      return res.status(404).json({ error: 'Usuario no encontrado' })
     }
 
-    const validAnswer = await bcrypt.compare(security_answer, user.security_answer)
-    if (!validAnswer) {
-      return res.status(401).json({ error: 'Respuesta de seguridad incorrecta' })
+    let valid = false
+
+    // Método 1: Pregunta de seguridad
+    if (security_answer && user.security_answer) {
+      valid = await bcrypt.compare(security_answer.toLowerCase().trim(), user.security_answer)
+    }
+
+    // Método 2: Código de recuperación
+    if (!valid && recovery_code && user.recovery_code) {
+      valid = await bcrypt.compare(recovery_code.toUpperCase().trim(), user.recovery_code)
+    }
+
+    if (!valid) {
+      return res.status(401).json({ error: 'Credenciales de recuperación incorrectas' })
     }
 
     const hashedPassword = await bcrypt.hash(new_password, 10)
@@ -404,7 +439,7 @@ app.post('/api/auth/recover', requireLicense, async (req, res) => {
       data: { password: hashedPassword }
     })
 
-    res.json({ success: true, message: 'Contraseña actualizada. Iniciá sesión con la nueva.' })
+    res.json({ success: true, message: 'Contraseña actualizada. Iniciá sesión.' })
 
   } catch (e) {
     console.error('Error recover:', e)
@@ -412,22 +447,39 @@ app.post('/api/auth/recover', requireLicense, async (req, res) => {
   }
 })
 
+
+
 // Get usuario actual
 app.get('/api/auth/me', requireLicense, requireAuth, async (req, res) => {
+  const adminEmail = await prisma.app_config.findUnique({ where: { key: 'admin_email' }})
+if (email && email !== adminEmail.value) {
+  // Requiere verificación extra, o directamente bloquear
+}
   const { password, security_answer, ...safeUser } = req.user
   res.json({ user: safeUser })
 })
 
 // Update perfil (nombre, email, avatar, password)
-app.patch('/api/auth/me', requireLicense, requireAuth, async (req, res) => {
-  const { nombre, email, avatar, current_password, new_password } = req.body
+  app.patch('/api/auth/me', requireLicense, requireAuth, async (req, res) => {
+  const { 
+    nombre, email, avatar, 
+    company_name, phone, timezone, language, industry, expected_volume,
+    current_password, new_password 
+  } = req.body
 
   try {
     const updateData = {}
 
-    if (nombre) updateData.nombre = nombre
-    if (avatar) updateData.avatar = avatar
-    if (req.body.affiliate_code) updateData.affiliate_code = req.body.affiliate_code
+    // Campos de perfil nuevos
+    if (nombre !== undefined) updateData.nombre = nombre
+    if (avatar !== undefined) updateData.avatar = avatar
+    if (company_name !== undefined) updateData.company_name = company_name
+    if (phone !== undefined) updateData.phone = phone
+    if (timezone !== undefined) updateData.timezone = timezone
+    if (language !== undefined) updateData.language = language
+    if (industry !== undefined) updateData.industry = industry
+    if (expected_volume !== undefined) updateData.expected_volume = expected_volume
+    if (req.body.affiliate_code !== undefined) updateData.affiliate_code = req.body.affiliate_code
 
     // Cambio de email: requiere password actual
     if (email && email !== req.user.email) {
@@ -1517,6 +1569,10 @@ app.post('/api/campaigns/:id/start', authOrSecret, async (req, res) => {
 })
 
 app.post('/api/setup/activate', async (req, res) => {
+  const existingUser = await prisma.usuarios.findFirst()
+    if (existingUser) {
+      return res.status(403).json({ error: 'Usuario ya registrado. Usá /login o recuperación.' })
+    }
   const { licenseKey } = req.body
   if (!licenseKey) return res.status(400).json({ error: 'licenseKey required' })
 

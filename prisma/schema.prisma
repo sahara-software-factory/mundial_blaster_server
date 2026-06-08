@@ -1,156 +1,196 @@
-  generator client {
-    provider = "prisma-client-js"
-  }
+generator client {
+  provider = "prisma-client-js"
+}
 
-  datasource db {
-    provider = "postgresql"
-    url      = env("DATABASE_URL")
-  }
-
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
 
 model usuarios {
   id                   String   @id @default(uuid())
   nombre               String
   email                String   @unique
-  password             String   // bcrypt hash
+  password             String
   avatar               String   @default("avatar1")
-  role                 String   @default("admin") // admin | user
+  role                 String   @default("admin")
   security_question    String?
-  security_answer      String?  // bcrypt hash de la respuesta
+  security_answer      String?
   last_login           DateTime?
   session_token        String?  @unique
   created_at           DateTime @default(now())
   updated_at           DateTime @updatedAt
   affiliate_code       String?  @unique
 
-  // ── ONBOARDING V2 ──
+  // Onboarding
   company_name         String?
-  phone                String?  // teléfono del admin/empresa
+  phone                String?
   timezone             String   @default("America/Argentina/Buenos_Aires")
   language             String   @default("es")
-  industry             String?  // e-commerce | servicios | educacion | salud | otro
-  expected_volume      String?  // 0-500 | 500-2000 | 2000-10000 | 10000+
+  industry             String?
+  expected_volume      String?
   onboarding_completed Boolean  @default(false)
+
+  // Recuperación
+  reset_token          String?
+  reset_token_expires  DateTime?
+  recovery_code        String?  // bcrypt hash del código de emergencia
+
+  // Relaciones inversas (datos huérfanos onDelete: SetNull)
+  lineas       lineas_whatsapp[]
+  campaigns    campaigns[]
+  scheduled    scheduled_campaigns[]
+  attachments  campaign_attachments[]
+  logs         campaign_logs[]
+  contacts     contacts[]
+  tags         tags[]
+  templates    message_templates[]
+  blacklists   blacklist[]
+  openai       openai_config[]
 }
 
-  model app_config {
-    key   String @id
-    value String
-  }
+model app_config {
+  key   String @id
+  value String
+}
 
-  model lineas_whatsapp {
-    id              String   @id @default(uuid())
-    phone           String   @unique
-    nombre          String   @default("Nueva Línea")
-    status          String   @default("DESCONECTADA")
-    fecha_creacion  DateTime @default(now())
-  }
+model lineas_whatsapp {
+  id              String   @id @default(uuid())
+  phone           String   @unique
+  nombre          String   @default("Nueva Línea")
+  status          String   @default("DESCONECTADA")
+  fecha_creacion  DateTime @default(now())
+  
+  owner_id        String?
+  owner           usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+}
 
-  model campaigns {
-    id            String    @id
-    name          String
-    line_id       String?
-    message       String
-    image_url     String?
-    total         Int       @default(0)
-    sent          Int       @default(0)
-    targets       Json?
-    failed        Int       @default(0)
-    status        String    @default("running") // running | completed | failed | scheduled
-    created_at    DateTime  @default(now())
-    finished_at   DateTime?
-    human_mode    Boolean   @default(false)
-    distribution_mode String   @default("single") // single | round_robin | split
-    selected_lines    String?  // JSON: ["uuid-linea-a", "uuid-linea-b"]
-    
-    
-    @@index([created_at])
-    @@index([status])
-  }
+model campaigns {
+  id                String   @id
+  name              String
+  line_id           String?
+  message           String
+  image_url         String?
+  total             Int      @default(0)
+  sent              Int      @default(0)
+  targets           Json?
+  failed            Int      @default(0)
+  status            String   @default("running")
+  created_at        DateTime @default(now())
+  finished_at       DateTime?
+  human_mode        Boolean  @default(false)
+  distribution_mode String   @default("single")
+  selected_lines    String?
+  
+  owner_id          String?
+  owner             usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
 
-  model scheduled_campaigns {
+  @@index([created_at])
+  @@index([status])
+}
+
+model scheduled_campaigns {
   id          String   @id @default(uuid())
   campaign_id String   @unique
   execute_at  DateTime
-  status      String   @default("pending") // pending | processing | completed | cancelled
+  status      String   @default("pending")
   createdAt   DateTime @default(now())
+
+  owner_id    String?
+  owner       usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
 }
 
 model campaign_attachments {
   id          String @id @default(uuid())
   campaign_id String
   url         String
-  type        String // image, video, pdf, audio
+  type        String
   filename    String?
+
+  owner_id    String?
+  owner       usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
 }
 
- model campaign_logs {
-    id            String    @id @default(uuid())
-    campaign_id   String
-    contact_phone String
-    status        String
-    line_id       String?     // ← opcional (cuando todas las líneas caen)
-    owner_id      String?     // ← opcional (WAService no tiene userId)
-    error         String?     // ← NUEVO: para guardar mensaje de error
-    sent_at       DateTime?
-    created_at    DateTime  @default(now())
-    message_id    String?
-    
-    has_reply     Boolean   @default(false)
-    replied_at    DateTime?
-    delivered_at DateTime?
-    read_at       DateTime?
-  
-  
-    @@index([campaign_id])
-    @@index([contact_phone])
-    @@index([created_at])
+model campaign_logs {
+  id            String    @id @default(uuid())
+  campaign_id   String
+  contact_phone String
+  status        String
+  line_id       String?
+  owner_id      String?
+  error         String?
+  sent_at       DateTime?
+  created_at    DateTime  @default(now())
+  message_id    String?
+  has_reply     Boolean   @default(false)
+  replied_at    DateTime?
+  delivered_at  DateTime?
+  read_at       DateTime?
+
+  owner           usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+
+  @@index([campaign_id])
+  @@index([contact_phone])
+  @@index([created_at])
 }
 
+model contacts {
+  id        String   @id @default(uuid())
+  name      String
+  phone     String   @unique
+  email     String?
+  company   String?
+  tags      String[] @default([])
+  notes     String?
+  source    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  model contacts {
-    id        String   @id @default(uuid())
-    name      String
-    phone     String   @unique
-    email     String?
-    company   String?
-    tags      String[] @default([])
-    notes     String?
-    source    String?  // csv, manual, campaign
-    createdAt DateTime @default(now())
-    updatedAt DateTime @updatedAt
-  }
+  owner_id  String?
+  owner     usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+}
 
-  model tags {
-    id     String @id @default(uuid())
-    name   String @unique
-    color  String @default("#3B82F6")
-    icon   String?
-  }
+model tags {
+  id     String @id @default(uuid())
+  name   String @unique
+  color  String @default("#3B82F6")
+  icon   String?
 
-  model message_templates {
-    id         String   @id @default(uuid())
-    name       String
-    content    String   // El mensaje con {{spintax}} y {{variables}}
-    category   String   @default("General") // Promociones, Recordatorios, Bienvenida...
-    variables  String[] @default([])       // ["nombre", "empresa"] detectadas auto
-    usageCount Int      @default(0)
-    createdAt  DateTime @default(now())
-  }
+  owner_id String?
+  owner    usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+}
 
-  model blacklist {
+model message_templates {
+  id         String   @id @default(uuid())
+  name       String
+  content    String
+  category   String   @default("General")
+  variables  String[] @default([])
+  usageCount Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  owner_id   String?
+  owner      usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+}
+
+model blacklist {
   id        String   @id @default(uuid())
   phone     String   @unique
-  reason    String?  // "optout", "bounce", "manual"
+  reason    String?
   createdAt DateTime @default(now())
+
+  owner_id  String?
+  owner     usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
 }
 
 model openai_config {
   id        String   @id @default(uuid())
-  owner_id  String   // o user_id
-  api_key   String   // encriptada con bcrypt o AES
+  owner_id  String
+  api_key   String
   model     String   @default("gpt-4o-mini")
   active    Boolean  @default(true)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  owner     usuarios @relation(fields: [owner_id], references: [id], onDelete: Cascade)
 }
