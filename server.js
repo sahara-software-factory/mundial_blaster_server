@@ -272,8 +272,8 @@ app.post('/api/auth/register', requireLicense, async (req, res) => {
       nombre, email, password, confirmPassword, avatar,
       security_question, security_answer,
       company_name, phone, timezone, language, industry, expected_volume,
-      line_phone, line_name,
-      recovery_code // ← NUEVO
+      line_phone, line_name, recovery_code, affiliate_code
+       
     } = req.body
 
     if (!nombre || !email || !password || !security_question || !security_answer) {
@@ -311,6 +311,7 @@ app.post('/api/auth/register', requireLicense, async (req, res) => {
         expected_volume,
         onboarding_completed: true,
         recovery_code: hashedRecovery,
+        affiliate_code: affiliate_code  || null
       }
     })
 
@@ -513,7 +514,8 @@ if (email && email !== adminEmail.value) {
       data: updateData
     })
 
-    const { password: pwd, security_answer: sa, ...safeUser } = updated
+    const { password: pwd, security_answer: sa, recovery_code: rc, reset_token: rt, ...safeUser } = updated
+
     res.json({ success: true, user: safeUser })
 
   } catch (e) {
