@@ -41,6 +41,7 @@ const io = new Server(server, {
 })
 
 app.use(express.json({ limit: '50mb' }))
+app.use(loadTier)
 app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
 // ============================================================
@@ -61,8 +62,23 @@ JwIDAQAB
 // ============================================================
 function validateLicense(token) {
   try {
-    return jwt.verify(token, LICENSE_PUBLIC_KEY, { algorithms: ['RS256'] })
+    const decoded = jwt.verify(token, LICENSE_PUBLIC_KEY, { algorithms: ['RS256'] })
+    
+    // Validar que el tier exista en nuestra config
+    if (!decoded.tier || !TIER_LIMITS[decoded.tier]) {
+      console.error('❌ Licencia con tier inválido:', decoded.tier)
+      return null
+    }
+    
+    // Validar issuer (opcional, para rechazar tokens de otra app)
+    if (decoded.iss && decoded.iss !== 'wabisend-v1' && decoded.iss !== 'mundial-blaster-v1') {
+      console.error('❌ Issuer inválido:', decoded.iss)
+      return null
+    }
+    
+    return decoded
   } catch (e) {
+    console.error('❌ Error validando licencia:', e.message)
     return null
   }
 }
@@ -95,6 +111,7 @@ function resolveSpintax(text) {
 // ============================================================
 const TIER_LIMITS = {
   starter: {
+    label: 'Starter',
     maxLines: 2,
     maxTemplates: 5,
     maxPendingCampaigns: 10,
@@ -111,6 +128,7 @@ const TIER_LIMITS = {
     hasMultiUser: false,
   },
   pro: {
+    label: 'Pro',
     maxLines: 5,
     maxTemplates: Infinity,
     maxPendingCampaigns: 50,
@@ -127,6 +145,7 @@ const TIER_LIMITS = {
     hasMultiUser: false,
   },
   business: {
+    label: 'Business',
     maxLines: Infinity,
     maxTemplates: Infinity,
     maxPendingCampaigns: Infinity,
@@ -1568,12 +1587,6 @@ app.post('/api/campaigns/:id/start', authOrSecret, async (req, res) => {
 
 app.post('/api/setup/activate', async (req, res) => {
   try {
-    // 🔒 Si ya existe usuario, no permitir re-setup
-    const existingUser = await prisma.usuarios.findFirst()
-    if (existingUser) {
-      return res.status(403).json({ error: 'Usuario ya registrado. Usá /login o recuperación.' })
-    }
-
     const { licenseKey } = req.body
     if (!licenseKey) return res.status(400).json({ error: 'licenseKey required' })
 
@@ -1633,61 +1646,82 @@ app.get('/api/license/status', async (req, res) => {
   res.json({ active: true, tier: license.tier, ...license })
 })
 
-// app.get('/api/license/status', authOrSecret, async (req, res) => {
-//   try {
-//     const origin = req.headers.origin || req.headers.referer || ''
-//     const isLocalhost = origin.includes('localhost') || origin.includes('127.0.0.1') || origin === ''
+app.get('/api/license/status', authOrSecret, async (req, res) => {
+  try {
+    const origin = req.headers.origin || req.headers.referer || ''
+    const isLocalhost = origin.includes('localhost') || origin.includes('127.0.0.1') || origin === ''
 
-   
-//     if (isLocalhost && req.userId) {
-      
-//       const userLicense = await prisma.licenses?.findFirst({
-//         where: { user_id: req.userId, active: true }
-//       })
+    // ─── BYPASS LOCALHOST / DEV ───
+    if (isLocalhost && req.userId) {
+      return res.json({
+        active: true,
+        tier: 'business',
+        maxLines: Infinity,
+        label: 'Dev Local',
+        features: Object.keys(TIER_LIMITS.business).filter(k => TIER_LIMITS.business[k] === true),
+      })
+    }
 
-//       if (userLicense) {
-//         return res.json({
-//           active: true,
-//           tier: userLicense.tier,
-//           maxLines: userLicense.maxLines || 3,
-//           label: userLicense.label || 'Pro'
-//         })
-//       }
+    // ─── LÓGICA REAL: leer de app_config ───
+    const config = await prisma.app_config.findUnique({ where: { key: 'license' } })
 
-      
-//       return res.json({
-//         active: true,
-//         tier: 'pro',
-//         maxLines: 3,
-//         label: 'Dev Local',
-//         features: { unlimited: true }
-//       })
-//     }
+    if (!config?.value) {
+      return res.json({ 
+        active: false, 
+        reason: 'NO_LICENSE',
+        tier: 'starter',
+        maxLines: TIER_LIMITS.starter.maxLines,
+        label: 'Starter (Sin licencia)'
+      })
+    }
 
-//     // ─── LÓGICA NORMAL DE PRODUCCIÓN ───
-//     const domain = req.headers.origin?.replace(/^https?:\/\//, '').split(':')[0] || req.headers.host
-    
-//     const license = await prisma.licenses.findFirst({
-//       where: { domain, active: true }
-//     })
+    // Validar JWT de la licencia
+    const license = validateLicense(config.value)
+    if (!license) {
+      return res.json({ 
+        active: false, 
+        reason: 'INVALID_LICENSE',
+        tier: 'starter',
+        maxLines: TIER_LIMITS.starter.maxLines,
+        label: 'Starter (Licencia inválida)'
+      })
+    }
 
-//     if (!license) {
-//       return res.json({ active: false, reason: 'NO_LICENSE_FOR_DOMAIN' })
-//     }
+    // Verificar que el tier existe en nuestra config
+    const tier = license.tier
+    if (!TIER_LIMITS[tier]) {
+      return res.json({ 
+        active: false, 
+        reason: 'UNKNOWN_TIER',
+        tier: 'starter',
+        maxLines: TIER_LIMITS.starter.maxLines,
+        label: 'Starter (Tier desconocido)'
+      })
+    }
 
-//     res.json({
-//       active: true,
-//       tier: license.tier,
-//       maxLines: license.maxLines,
-//       label: license.label,
-//       features: license.features
-//     })
+    const tierConfig = TIER_LIMITS[tier]
 
-//   } catch (e) {
-//     console.error('Error license/status:', e)
-//     res.status(500).json({ error: 'Error verificando licencia' })
-//   }
-// })
+    res.json({
+      active: true,
+      tier: tier,
+      label: license.label || tierConfig.label || tier,
+      maxLines: tierConfig.maxLines,
+      maxTemplates: tierConfig.maxTemplates,
+      maxPendingCampaigns: tierConfig.maxPendingCampaigns,
+      features: Object.entries(tierConfig)
+        .filter(([_, v]) => v === true)
+        .map(([k]) => k),
+      // Datos de la licencia para debugging
+      email: license.email,
+      iat: license.iat,
+      iss: license.iss,
+    })
+
+  } catch (e) {
+    console.error('Error license/status:', e)
+    res.status(500).json({ error: 'Error verificando licencia' })
+  }
+})
 
 // ========== ADMIN (nuclear, solo con SECRET) ==========
 
