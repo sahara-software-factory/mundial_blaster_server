@@ -84,16 +84,51 @@ function validateLicense(token) {
 }
 
 function generateToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' })
+  const secret = JWT_SECRET
+  if (!secret) throw new Error('JWT_SECRET no inicializada')
+  return jwt.sign(payload, secret, { expiresIn: '8h' })
 }
 
 function verifyToken(token) {
   try {
-    return jwt.verify(token, JWT_SECRET)
+    const secret = JWT_SECRET
+    if (!secret) return null
+    return jwt.verify(token, secret)
   } catch (e) {
     return null
   }
 }
+
+let JWT_SECRET = process.env.JWT_SECRET
+
+async function ensureJwtSecret() {
+  // 1. Si viene por variable de entorno, usar esa
+  if (JWT_SECRET) return JWT_SECRET
+
+  // 2. Buscar en app_config (generado en ejecuciones anteriores)
+  const config = await prisma.app_config.findUnique({ where: { key: 'jwt_secret' } })
+  if (config?.value) {
+    JWT_SECRET = config.value
+    return JWT_SECRET
+  }
+
+  // 3. Generar una nueva y guardarla
+  const crypto = require('crypto')
+  const newSecret = crypto.randomBytes(64).toString('hex')
+  
+  await prisma.app_config.create({
+    data: { key: 'jwt_secret', value: newSecret }
+  })
+  
+  JWT_SECRET = newSecret
+  console.log('🔐 JWT_SECRET auto-generada y guardada en DB')
+  return JWT_SECRET
+}
+
+// Llamar al iniciar el servidor
+ensureJwtSecret().catch(e => {
+  console.error('❌ Error inicializando JWT_SECRET:', e)
+})
 
 function resolveSpintax(text) {
   if (!text) return text
@@ -354,9 +389,14 @@ app.post('/api/auth/register', requireLicense, async (req, res) => {
       create: { key: 'admin_email', value: email.toLowerCase().trim() }
     })
 
+    const secret = JWT_SECRET || await ensureJwtSecret()
+    if (!secret) {
+      return res.status(500).json({ error: 'Error interno: JWT no inicializado' })
+    }
+
     const token = jwt.sign(
       { userId: newUser.id, email: newUser.email, role: newUser.role },
-      process.env.JWT_SECRET,
+      secret,
       { expiresIn: '8h' }
     )
 
@@ -398,7 +438,11 @@ app.post('/api/auth/login', requireLicense, async (req, res) => {
       data: { last_login: new Date() }
     })
 
-    const token = generateToken({ userId: user.id, email: user.email, role: user.role })
+      const token = generateToken({
+      userId: newUser.id,
+      email: newUser.email,
+      role: newUser.role
+    })
 
     const { password: _, security_answer: __, ...safeUser } = user
 
