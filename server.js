@@ -99,7 +99,7 @@ function verifyToken(token) {
   }
 }
 
-let JWT_SECRET = process.env.JWT_SECRET
+// let JWT_SECRET = process.env.JWT_SECRET
 
 async function ensureJwtSecret() {
   // 1. Si viene por variable de entorno, usar esa
