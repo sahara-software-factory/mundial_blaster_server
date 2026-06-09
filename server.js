@@ -632,14 +632,13 @@ app.get('/api/auth/check', async (req, res) => {
 })
 
 
-// /api/leads/capture — ahora sí guarda en Google Sheet desde el servidor
+const LEAD_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbyhfi641UqLoyRqDuZRiapP5L3XqtGbivxTj2WlooA8aBmZ9JXHdN842t53TjHOm9WlrA/exec"
+
 app.post('/api/leads/capture', async (req, res) => {
   try {
     const { nombre, email, company_name, phone, industry, expected_volume, timezone, fecha } = req.body
-    
     console.log('📥 Lead recibido:', { nombre, email })
 
-    // 👇 Llamada server-side: sin CORS, sin no-cors, sin problemas
     const params = new URLSearchParams()
     params.append("nombre", nombre || "")
     params.append("email", email || "")
@@ -650,10 +649,9 @@ app.post('/api/leads/capture', async (req, res) => {
     if (timezone) params.append("timezone", timezone)
     params.append("fecha", fecha || new Date().toISOString())
 
-    const sheetRes = await fetch(process.env.LEAD_SHEET_WEBHOOK_URL, {
+    const sheetRes = await fetch(LEAD_SHEET_WEBHOOK_URL, {
       method: "POST",
       body: params,
-      // Sin mode: "no-cors" — el servidor puede leer la respuesta
     })
 
     const sheetData = await sheetRes.json()
