@@ -438,10 +438,10 @@ app.post('/api/auth/login', requireLicense, async (req, res) => {
       data: { last_login: new Date() }
     })
 
-      const token = generateToken({
-      userId: newUser.id,
-      email: newUser.email,
-      role: newUser.role
+        const token = generateToken({
+      userId: user.id,
+      email: user.email,
+      role: user.role
     })
 
     const { password: _, security_answer: __, ...safeUser } = user
