@@ -1723,9 +1723,16 @@ app.post('/api/setup/activate', async (req, res) => {
 app.get('/api/license/status', async (req, res) => {
   try {
     const origin = req.headers.origin || req.headers.referer || ''
-    const isLocalhost = origin.includes('localhost') || origin.includes('127.0.0.1') || origin === ''
+    const host = req.headers.host || ''
+    
+    // Bypass localhost: solo si REALMENTE es localhost
+    const isLocalhost = (
+      origin.includes('localhost') || 
+      origin.includes('127.0.0.1') ||
+      host.includes('localhost') ||
+      host.includes('127.0.0.1')
+    ) && origin !== '' // ← ELIMINADO: origin === '' activaba el bypass por proxy
 
-    // ─── BYPASS LOCALHOST / DEV ───
     if (isLocalhost) {
       return res.json({
         active: true,
