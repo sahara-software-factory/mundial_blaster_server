@@ -235,3 +235,16 @@ model openai_config {
   @@index([owner_id])
   @@index([active])
 }
+
+model lid_mappings {
+  id        String   @id @default(uuid())
+  lineId    String
+  lid       String
+  phone     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([lineId, lid])
+  @@index([lineId, phone])
+  @@index([lid])
+}
