@@ -432,33 +432,31 @@ async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
    let lastDelayMs = 0
 
 
-   // Dentro de sendCampaign(), antes de enviar cada mensaje:
-for (const target of targets) {
-  // ─── SKIP BLACKLIST ───
-  if (options.skipBlacklist) {
-    const blacklisted = await this.prisma.blacklist.findUnique({
-      where: { phone: target.phone.replace(/\D/g, '') }
-    })
-    if (blacklisted) {
-      console.log(`⛔ Saltando ${target.phone} — blacklist`)
-      await this.prisma.campaign_logs.create({
-        data: {
-          campaign_id: campaignId,
-          contact_phone: target.phone,
-          status: 'skipped_blacklist',
-          line_id: lineaActual?.id,
-          owner_id: options.ownerId || null,
-        }
-      })
-      continue // NO enviar
-    }
-  }
-
-  // ... acá va el envío real (sendMessage, delay, etc.)
-}
+   
 
   for (let i = 0; i < targets.length; i++) {
     const target = targets[i]
+
+    if (options.skipBlacklist) {
+        const cleanPhone = target.phone.replace(/\D/g, '')
+        const blacklisted = await this.prisma.blacklist.findUnique({
+          where: { phone: cleanPhone }
+        })
+        if (blacklisted) {
+          console.log(`⛔ Saltando ${target.phone} — blacklist`)
+          await this.prisma.campaign_logs.create({
+            data: {
+              campaign_id: campaignId,
+              contact_phone: target.phone,
+              status: 'skipped_blacklist',
+              line_id: null,           // ← aún no asignamos línea
+              owner_id: options.ownerId || null,
+            }
+          }).catch(() => {})
+          continue // NO enviar, NO contar como fallo
+        }
+      }
+
 
     // ⏹️ CHEQUEAR CANCELACIÓN
     try {
