@@ -231,15 +231,38 @@ class WAService {
   for (const msg of messages) {
     if (!msg.message || msg.key.fromMe) continue
 
-    const from = msg.key.remoteJid?.replace('@s.whatsapp.net', '')
-    if (!from) continue
+    const fromPhone = this.cleanJid(msg.key.remoteJid)
+    if (!fromPhone || fromPhone.length < 10) continue
 
     const messageBody = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
 
        // ─── AUTO BLACKLIST: verificar palabras clave ───
-    try {
-      const cleanFrom = this.cleanJid(msg.key.remoteJid) // ← USA EL MÉTODO QUE YA TENÉS
-      if (!cleanFrom) continue
+     try {
+      // 1. Extraer número REAL (no LID)
+      const rawJid = msg.key.remoteJid
+      const altJid = msg.key.remoteJidAlt
+      
+      let fromPhone = null
+      let isLid = false
+
+      // Intentar remoteJid primero
+      if (rawJid?.includes('@s.whatsapp.net')) {
+        fromPhone = this.cleanJid(rawJid)
+      } else if (rawJid?.includes('@lid')) {
+        isLid = true
+      }
+
+      // Fallback a remoteJidAlt (a veces trae el número real cuando remoteJid es LID)
+      if (!fromPhone && altJid?.includes('@s.whatsapp.net')) {
+        fromPhone = this.cleanJid(altJid)
+        isLid = false
+      }
+
+      // Validación: si sigue siendo LID o no parece teléfono, skip
+      if (!fromPhone || fromPhone.length < 10 || fromPhone.length > 15 || isLid) {
+        console.log(`⚠️ Auto-blacklist skip: LID o número inválido detectado (raw: ${rawJid}, alt: ${altJid})`)
+        continue
+      }
 
       const config = await this.prisma.app_config.findUnique({ where: { key: 'blacklist_keywords' } })
       const keywords = config?.value ? JSON.parse(config.value) : ['basta', 'no molesten', 'no me interesa', 'no, gracias', 'eliminar', 'stop', 'darme de baja']
@@ -247,9 +270,8 @@ class WAService {
       const matched = keywords.find(k => lowerBody.includes(k.toLowerCase()))
 
       if (matched) {
-        // findFirst + create/update evita el drama del upsert con compound unique
         const existing = await this.prisma.blacklist.findFirst({
-          where: { phone: cleanFrom }
+          where: { phone: fromPhone }
         })
 
         if (existing) {
@@ -260,15 +282,15 @@ class WAService {
         } else {
           await this.prisma.blacklist.create({
             data: {
-              phone: cleanFrom,
+              phone: fromPhone,
               reason: `auto: "${matched}"`,
               owner_id: null
             }
           })
         }
 
-        console.log(`🚫 Auto-blacklist: ${cleanFrom} por keyword "${matched}"`)
-        this.io.emit('auto_blacklist', { phone: cleanFrom, keyword: matched, timestamp: new Date() })
+        console.log(`🚫 Auto-blacklist: ${fromPhone} por keyword "${matched}"`)
+        this.io.emit('auto_blacklist', { phone: fromPhone, keyword: matched, timestamp: new Date() })
       }
     } catch (e) {
       console.error('Auto-blacklist error:', e)
@@ -459,7 +481,7 @@ async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
 
     if (options.skipBlacklist) {
         const cleanPhone = target.phone.replace(/\D/g, '')
-        const blacklisted = await this.prisma.blacklist.findUnique({
+        const blacklisted = await this.prisma.blacklist.findFirst({
           where: { phone: cleanPhone }
         })
         if (blacklisted) {
