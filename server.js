@@ -1,3 +1,4 @@
+const nodeFetch = globalThis.fetch ?? require('node-fetch')
 require('dotenv').config()
 const express = require('express')
 const http = require('http')
@@ -10,7 +11,14 @@ const cron = require('node-cron')
 
 const PORT = process.env.PORT || 8080
 const SECRET = process.env.WHATSAPP_SECRET
-const JWT_SECRET = process.env.JWT_SECRET || SECRET || 'cambiar-en-produccion'
+let JWT_SECRET = process.env.JWT_SECRET || process.env.WHATSAPP_SECRET
+
+if (!JWT_SECRET && process.env.NODE_ENV === 'production') {
+  console.error('❌ FATAL: JWT_SECRET no configurado en producción')
+  process.exit(1) // Mejor crashear que correr inseguro
+}
+
+JWT_SECRET = JWT_SECRET || 'dev-only-insecure-secret'
 
 const prisma = new PrismaClient()
 const app = express()
@@ -43,6 +51,26 @@ const io = new Server(server, {
 app.use(express.json({ limit: '50mb' }))
 app.use(loadTier)
 app.use(express.urlencoded({ limit: '50mb', extended: true }))
+
+let tierCache = null
+let tierCacheTime = 0
+const TIER_CACHE_TTL = 60_000 // 1 minuto
+
+async function loadTier(req, res, next) {
+  const now = Date.now()
+  if (tierCache && (now - tierCacheTime) < TIER_CACHE_TTL) {
+    req.tier = tierCache.tier
+    req.tierConfig = tierCache.config
+    return next()
+  }
+
+  const tier = await getAppTier()
+  tierCache = { tier, config: TIER_LIMITS[tier] || TIER_LIMITS.starter }
+  tierCacheTime = now
+  req.tier = tierCache.tier
+  req.tierConfig = tierCache.config
+  next()
+}
 
 // ============================================================
 // 🔑 CLAVE PÚBLICA PARA LICENCIAS
@@ -327,7 +355,6 @@ app.post('/api/auth/register', requireLicense, async (req, res) => {
       security_question, security_answer,
       company_name, phone, timezone, language, industry, expected_volume,
       line_phone, line_name, recovery_code, affiliate_code
-       
     } = req.body
 
     if (!nombre || !email || !password || !security_question || !security_answer) {
@@ -365,9 +392,27 @@ app.post('/api/auth/register', requireLicense, async (req, res) => {
         expected_volume,
         onboarding_completed: true,
         recovery_code: hashedRecovery,
-        affiliate_code: affiliate_code  || null
+        affiliate_code: affiliate_code || null
       }
     })
+
+    // 📱 CREAR LÍNEA WHATSAPP si viene en el onboarding
+    if (line_phone && line_name) {
+      try {
+        await prisma.lineas_whatsapp.create({
+          data: {
+            phone: line_phone.trim(),
+            nombre: line_name.trim(),
+            status: 'DESCONECTADA',
+            owner_id: newUser.id,
+          }
+        })
+        console.log('📱 Línea WhatsApp creada:', line_phone)
+      } catch (lineError) {
+        console.error('⚠️ Error creando línea (no crítico):', lineError.message)
+        // No falla el registro si la línea falla
+      }
+    }
 
     // 🔥 RECLAIM: Si hay datos huérfanos (owner_id = null), asignarlos al nuevo admin
     await prisma.$transaction([
@@ -632,37 +677,6 @@ app.get('/api/auth/check', async (req, res) => {
 })
 
 
-const LEAD_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbyhfi641UqLoyRqDuZRiapP5L3XqtGbivxTj2WlooA8aBmZ9JXHdN842t53TjHOm9WlrA/exec"
-
-app.post('/api/leads/capture', async (req, res) => {
-  try {
-    const { nombre, email, company_name, phone, industry, expected_volume, timezone, fecha } = req.body
-    console.log('📥 Lead recibido:', { nombre, email })
-
-    const params = new URLSearchParams()
-    params.append("nombre", nombre || "")
-    params.append("email", email || "")
-    if (company_name) params.append("company_name", company_name)
-    if (phone) params.append("phone", phone)
-    if (industry) params.append("industry", industry)
-    if (expected_volume) params.append("expected_volume", expected_volume)
-    if (timezone) params.append("timezone", timezone)
-    params.append("fecha", fecha || new Date().toISOString())
-
-    const sheetRes = await fetch(LEAD_SHEET_WEBHOOK_URL, {
-      method: "POST",
-      body: params,
-    })
-
-    const sheetData = await sheetRes.json()
-    console.log("✅ Google Sheet respondió:", sheetData)
-
-    res.json({ success: true })
-  } catch (e) {
-    console.error('Lead capture error:', e)
-    res.status(500).json({ error: 'Error guardando lead' })
-  }
-})
 
 // ========== CONTACTOS ==========
 
@@ -1703,25 +1717,6 @@ app.post('/api/setup/activate', async (req, res) => {
   }
 })
 
-app.get('/api/license/status', async (req, res) => {
-  const config = await prisma.app_config.findUnique({ where: { key: 'license' } })
-  if (!config?.value) return res.json({ active: false })
-
-  const license = validateLicense(config.value)
-  if (!license) return res.json({ active: false, invalid: true })
-
-  // Anti-clonación: verificar dominio vinculado
-  const instanceDomain = process.env.RAILWAY_STATIC_URL ||
-                         process.env.VERCEL_URL ||
-                         req.headers.host
-  const savedDomain = await prisma.app_config.findUnique({ where: { key: 'instance_domain' } })
-
-  if (savedDomain?.value && savedDomain.value !== instanceDomain) {
-    return res.json({ active: false, domainMismatch: true })
-  }
-
-  res.json({ active: true, tier: license.tier, ...license })
-})
 
 app.get('/api/license/status', authOrSecret, async (req, res) => {
   try {
@@ -1911,6 +1906,59 @@ app.post('/api/affiliate/generate', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Error generando código' })
   }
 })
+
+
+// server.js — endpoint leads/capture
+const LEAD_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbyhfi641UqLoyRqDuZRiapP5L3XqtGbivxTj2WlooA8aBmZ9JXHdN842t53TjHOm9WlrA/exec"
+
+app.post('/api/leads/capture', async (req, res) => {
+  try {
+    const { nombre, email, company_name, phone, industry, expected_volume, timezone, fecha } = req.body
+    console.log('📥 Lead recibido:', { nombre, email, company_name })
+
+    if (!LEAD_SHEET_WEBHOOK_URL) {
+      console.warn('⚠️ LEAD_SHEET_WEBHOOK_URL no definida')
+      return res.json({ success: true, warning: 'Webhook no configurado' })
+    }
+
+    // Construir URL con params
+    const url = new URL(LEAD_SHEET_WEBHOOK_URL)
+    url.searchParams.set("nombre", nombre || "")
+    url.searchParams.set("email", email || "")
+    url.searchParams.set("company_name", company_name || "")
+    url.searchParams.set("phone", phone || "")
+    url.searchParams.set("industry", industry || "")
+    url.searchParams.set("expected_volume", expected_volume || "")
+    url.searchParams.set("timezone", timezone || "")
+    url.searchParams.set("fecha", fecha || new Date().toISOString())
+
+    console.log('📤 Enviando a Sheet:', url.toString())
+
+    // fetch con redirect follow (default en Node 18+)
+    const sheetRes = await fetch(url.toString(), {
+      method: 'GET',
+      redirect: 'follow',
+    })
+
+    const responseText = await sheetRes.text()
+    console.log('📡 Sheet response status:', sheetRes.status)
+    console.log('📡 Sheet response body:', responseText)
+
+    let sheetData
+    try {
+      sheetData = JSON.parse(responseText)
+    } catch {
+      sheetData = { raw: responseText }
+    }
+
+    res.json({ success: true, sheetResponse: sheetData })
+
+  } catch (e) {
+    console.error('❌ Lead capture error:', e)
+    res.status(500).json({ error: 'Error guardando lead', detail: e.message })
+  }
+})
+
 
 // CRON
 
