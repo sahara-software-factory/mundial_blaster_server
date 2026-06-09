@@ -11,7 +11,6 @@ const cron = require('node-cron')
 
 const PORT = process.env.PORT || 8080
 const SECRET = process.env.WHATSAPP_SECRET
-let JWT_SECRET = process.env.JWT_SECRET || process.env.WHATSAPP_SECRET
 
 let JWT_SECRET = process.env.JWT_SECRET
 
