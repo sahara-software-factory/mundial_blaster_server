@@ -1584,26 +1584,6 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       ownerId: req.user?.id 
     }
 
-    if (req.body.skipBlacklist) {
-  const blacklisted = await prisma.blacklist.findUnique({
-    where: { phone: target.phone.replace(/\D/g, '') }
-  })
-  if (blacklisted) {
-    console.log(`⛔ Saltando ${target.phone} — está en blacklist`)
-    skippedCount++
-    // Opcional: guardar log como "skipped_blacklist"
-    await prisma.campaign_logs.create({
-      data: {
-        campaign_id: campaign.id,
-        contact_phone: target.phone,
-        status: 'skipped_blacklist',
-        owner_id: req.user.id,
-      }
-    })
-    continue // No enviar
-  }
-}
-
     waService.sendCampaign(newCampaign.id, lineasSeleccionadas, body.targets, body.message.trim(), sendOptions)
       .then(() => console.log(`✅ Campaña ${newCampaign.id} finalizada`))
       .catch(err => console.error(`❌ Campaña ${newCampaign.id} falló:`, err))
