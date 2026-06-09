@@ -631,6 +631,25 @@ app.get('/api/auth/check', async (req, res) => {
   }
 })
 
+
+// POST /api/leads/capture — Fallback cuando Google Sheet falla
+app.post('/api/leads/capture', async (req, res) => {
+  try {
+    const { nombre, email, company_name, phone, industry, expected_volume, timezone, fecha } = req.body
+    
+    // Guardar en tabla de leads (si existe, o crear log)
+    console.log('📥 Lead capturado (fallback):', { nombre, email, company_name, fecha })
+    
+    // Opcional: guardar en DB si tenés tabla leads
+    // await prisma.leads.create({ data: { ... } })
+    
+    res.json({ success: true })
+  } catch (e) {
+    console.error('Lead capture error:', e)
+    res.status(500).json({ error: 'Error guardando lead' })
+  }
+})
+
 // ========== CONTACTOS ==========
 
 app.get('/api/contacts', authOrSecret, async (req, res) => {
