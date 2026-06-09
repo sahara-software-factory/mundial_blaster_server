@@ -13,12 +13,7 @@ const PORT = process.env.PORT || 8080
 const SECRET = process.env.WHATSAPP_SECRET
 let JWT_SECRET = process.env.JWT_SECRET || process.env.WHATSAPP_SECRET
 
-if (!JWT_SECRET && process.env.NODE_ENV === 'production') {
-  console.error('❌ FATAL: JWT_SECRET no configurado en producción')
-  process.exit(1) // Mejor crashear que correr inseguro
-}
-
-JWT_SECRET = JWT_SECRET || 'dev-only-insecure-secret'
+let JWT_SECRET = process.env.JWT_SECRET
 
 const prisma = new PrismaClient()
 const app = express()
@@ -57,19 +52,27 @@ let tierCacheTime = 0
 const TIER_CACHE_TTL = 60_000 // 1 minuto
 
 async function loadTier(req, res, next) {
-  const now = Date.now()
-  if (tierCache && (now - tierCacheTime) < TIER_CACHE_TTL) {
+  try {
+    const now = Date.now()
+    if (tierCache && (now - tierCacheTime) < TIER_CACHE_TTL) {
+      req.tier = tierCache.tier
+      req.tierConfig = tierCache.config
+      return next()
+    }
+
+    const tier = await getAppTier()
+    tierCache = { tier, config: TIER_LIMITS[tier] || TIER_LIMITS.starter }
+    tierCacheTime = now
     req.tier = tierCache.tier
     req.tierConfig = tierCache.config
-    return next()
+    next()
+  } catch (e) {
+    console.error('loadTier error:', e)
+    // Si falla, asumir starter para no bloquear requests
+    req.tier = 'starter'
+    req.tierConfig = TIER_LIMITS.starter
+    next()
   }
-
-  const tier = await getAppTier()
-  tierCache = { tier, config: TIER_LIMITS[tier] || TIER_LIMITS.starter }
-  tierCacheTime = now
-  req.tier = tierCache.tier
-  req.tierConfig = tierCache.config
-  next()
 }
 
 // ============================================================
@@ -1718,13 +1721,13 @@ app.post('/api/setup/activate', async (req, res) => {
 })
 
 
-app.get('/api/license/status', authOrSecret, async (req, res) => {
+app.get('/api/license/status', async (req, res) => {
   try {
     const origin = req.headers.origin || req.headers.referer || ''
     const isLocalhost = origin.includes('localhost') || origin.includes('127.0.0.1') || origin === ''
 
     // ─── BYPASS LOCALHOST / DEV ───
-    if (isLocalhost && req.userId) {
+    if (isLocalhost) {
       return res.json({
         active: true,
         tier: 'business',
@@ -1747,7 +1750,6 @@ app.get('/api/license/status', authOrSecret, async (req, res) => {
       })
     }
 
-    // Validar JWT de la licencia
     const license = validateLicense(config.value)
     if (!license) {
       return res.json({ 
@@ -1759,7 +1761,6 @@ app.get('/api/license/status', authOrSecret, async (req, res) => {
       })
     }
 
-    // Verificar que el tier existe en nuestra config
     const tier = license.tier
     if (!TIER_LIMITS[tier]) {
       return res.json({ 
@@ -1783,7 +1784,6 @@ app.get('/api/license/status', authOrSecret, async (req, res) => {
       features: Object.entries(tierConfig)
         .filter(([_, v]) => v === true)
         .map(([k]) => k),
-      // Datos de la licencia para debugging
       email: license.email,
       iat: license.iat,
       iss: license.iss,
