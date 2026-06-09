@@ -36,6 +36,7 @@ class WAService {
     this.presenceIntervals = {}
     this.sessionsDir = '/app/sessions'
     this.msgRetryCounterCache = new NodeCache()
+    this.lidCache = new Map() 
     fs.ensureDirSync(this.sessionsDir)
   }
 
@@ -247,8 +248,9 @@ class WAService {
 
     // ─── LID MAPPING: guardar si Baileys nos dio un LID mapeado ───
     try {
-      if (msg.key.remoteJid?.includes('@lid')) {
+      if (msg.key.remoteJid?.includes('@lid') && fromPhone) {   // ← guard `&& fromPhone`
         const lidClean = msg.key.remoteJid.split('@')[0]
+        this.lidCache.set(`${lineId}:${lidClean}`, fromPhone)   // ← también popular caché
         await this.prisma.lid_mappings.upsert({
           where: { lineId_lid: { lineId, lid: lidClean } },
           update: { phone: fromPhone, updatedAt: new Date() },
@@ -306,7 +308,8 @@ class WAService {
         const { key, update: statusUpdate } = update
         if (!key.id || !key.remoteJid) continue
 
-        const phone = key.remoteJid.replace('@s.whatsapp.net', '')
+        const phone = await this.resolvePhoneFromJid(lineId, key.remoteJid)
+if (!phone) continue
 
         // Buscar el log más reciente de este número
         const log = await this.prisma.campaign_logs.findFirst({
@@ -334,6 +337,19 @@ class WAService {
         }
       }
     })
+
+
+waClient.ev.on('contacts.upsert', async (contacts) => {
+  for (const contact of contacts) {
+    await this._storeLidMappingFromContact(lineId, contact).catch(() => {})
+  }
+})
+
+waClient.ev.on('contacts.update', async (updates) => {
+  for (const update of updates) {
+    await this._storeLidMappingFromContact(lineId, update).catch(() => {})
+  }
+})
   }
 
     cleanJid(jid) {
@@ -355,16 +371,61 @@ class WAService {
     return jid
   }
 
+
+  // NUEVO (no había antes):
+async _storeLidMappingFromContact(lineId, contact) {
+  if (!contact?.id) return
+
+  let lid = null
+  let phone = null
+
+  // Caso A: contact.id es un LID y trae phoneNumber
+  // { id: '27590987374634@lid', phoneNumber: '+5491234567890' }
+  if (contact.id.includes('@lid') && contact.phoneNumber) {
+    lid = contact.id.split('@')[0]
+    phone = contact.phoneNumber.replace(/\D/g, '')
+  }
+
+  // Caso B: contact.id es un phone JID y trae el campo lid
+  // { id: '5491234567890@s.whatsapp.net', lid: '27590987374634' }
+  if (contact.id.includes('@s.whatsapp.net') && contact.lid) {
+    phone = contact.id.split('@')[0].replace(/\D/g, '')
+    lid = typeof contact.lid === 'string'
+      ? contact.lid.split('@')[0]
+      : String(contact.lid)
+  }
+
+  if (!lid || !phone || phone.length < 8) return
+
+  const cacheKey = `${lineId}:${lid}`
+  if (this.lidCache.get(cacheKey) === phone) return // ya lo tenemos, no tocar BD
+
+  this.lidCache.set(cacheKey, phone)
+  await this.prisma.lid_mappings.upsert({
+    where: { lineId_lid: { lineId, lid } },
+    update: { phone, updatedAt: new Date() },
+    create: { lineId, lid, phone }
+  }).catch(() => {})
+  console.log(`🔗 LID mapeado: ${lid} → ${phone} (línea ${lineId})`)
+}
+
   async resolvePhoneFromJid(lineId, rawJid) {
     if (!rawJid) return null
 
-    // Intento 1: jidDecode (como Sahara One)
+    // Intento 0: caché en memoria (sin I/O, instantáneo)
+    if (rawJid.includes('@lid')) {
+      const lidClean = rawJid.split('@')[0]
+      const cached = this.lidCache.get(`${lineId}:${lidClean}`)
+      if (cached) return cached
+    }
+
+    // Intento 1: jidDecode — funciona para @s.whatsapp.net, NO para @lid
     const decoded = this.decodeJid(rawJid)
     if (decoded?.includes('@s.whatsapp.net')) {
       return this.cleanJid(decoded)
     }
 
-    // Intento 2: jidNormalizedUser (fuerza formato real)
+    // Intento 2: jidNormalizedUser — ídem, solo formatea, no resuelve LIDs
     try {
       const normalized = jidNormalizedUser(rawJid)
       if (normalized?.includes('@s.whatsapp.net')) {
@@ -372,13 +433,16 @@ class WAService {
       }
     } catch (e) {}
 
-    // Intento 3: fallback a lid_mappings si sigue siendo LID
-    if (rawJid?.includes('@lid')) {
+    // Intento 3: BD — y popular el caché para la próxima vez
+    if (rawJid.includes('@lid')) {
       const lidClean = rawJid.split('@')[0]
       const mapping = await this.prisma.lid_mappings.findUnique({
         where: { lineId_lid: { lineId, lid: lidClean } }
       }).catch(() => null)
-      if (mapping?.phone) return this.cleanJid(mapping.phone)
+      if (mapping?.phone) {
+        this.lidCache.set(`${lineId}:${lidClean}`, mapping.phone) // ← popular caché
+        return this.cleanJid(mapping.phone)
+      }
     }
 
     return null
@@ -406,8 +470,20 @@ class WAService {
         messagePayload = { text: content }
       }
 
-      await waClient.sendMessage(jid, messagePayload)
-      return { success: true }
+      const sentMsg = await waClient.sendMessage(jid, messagePayload)
+
+      if (sentMsg?.key?.remoteJid?.includes('@lid')) {
+      const lid = sentMsg.key.remoteJid.split('@')[0]
+      this.lidCache.set(`${lineId}:${lid}`, cleanNumber)
+      await this.prisma.lid_mappings.upsert({
+        where: { lineId_lid: { lineId, lid } },
+        update: { phone: cleanNumber, updatedAt: new Date() },
+        create: { lineId, lid, phone: cleanNumber }
+      }).catch(() => {})
+      console.log(`🔗 LID capturado al enviar: ${lid} → ${cleanNumber}`)
+    }
+
+    return { success: true }
     } catch (error) {
       console.error('❌ Error sendMessage:', error)
       throw error
@@ -450,7 +526,19 @@ class WAService {
         messagePayload = { text: content }
       }
 
-      await waClient.sendMessage(jid, messagePayload)
+       const sentMsg = await waClient.sendMessage(jid, messagePayload)
+
+      if (sentMsg?.key?.remoteJid?.includes('@lid')) {
+        const lid = sentMsg.key.remoteJid.split('@')[0]
+        this.lidCache.set(`${lineId}:${lid}`, cleanNumber)
+        await this.prisma.lid_mappings.upsert({
+          where: { lineId_lid: { lineId, lid } },
+          update: { phone: cleanNumber, updatedAt: new Date() },
+          create: { lineId, lid, phone: cleanNumber }
+        }).catch(() => {})
+        console.log(`🔗 LID capturado al enviar (human): ${lid} → ${cleanNumber}`)
+      }
+
       console.log(`[HUMAN MODE] ✅ Mensaje enviado`)
       return { success: true }
     } catch (err) {
