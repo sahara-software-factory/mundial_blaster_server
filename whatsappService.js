@@ -226,42 +226,62 @@ class WAService {
       }
     })
 
-    // 3. Mensajes entrantes: ignoramos todo (modo emisor puro)
-        // 3. Mensajes entrantes: TRACKING DE RESPUESTAS
     waClient.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return
-      for (const msg of messages) {
-        if (!msg.message || msg.key.fromMe) continue
+  if (type !== 'notify') return
+  for (const msg of messages) {
+    if (!msg.message || msg.key.fromMe) continue
 
-        const from = msg.key.remoteJid?.replace('@s.whatsapp.net', '')
-        if (!from) continue
+    const from = msg.key.remoteJid?.replace('@s.whatsapp.net', '')
+    if (!from) continue
 
-        // Buscar si este número fue destinatario de una campaña reciente (últimos 30 días)
-        const recentLog = await this.prisma.campaign_logs.findFirst({
-          where: {
-            contact_phone: from,
-            status: 'sent',
-            created_at: { gte: new Date(Date.now() - 30 * 86400000) }
-          },
-          orderBy: { created_at: 'desc' }
+    const messageBody = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
+
+    // ─── AUTO BLACKLIST: verificar palabras clave ───
+    try {
+      const config = await this.prisma.app_config.findUnique({ where: { key: 'blacklist_keywords' } })
+      const keywords = config?.value ? JSON.parse(config.value) : ['basta', 'no molesten', 'no me interesa', 'no, gracias', 'eliminar', 'stop', 'darme de baja']
+      const lowerBody = messageBody.toLowerCase()
+      const matched = keywords.find(k => lowerBody.includes(k.toLowerCase()))
+
+      if (matched) {
+        await this.prisma.blacklist.upsert({
+          where: { phone: from.replace(/\D/g, '') },
+          update: { reason: `auto: "${matched}"` },
+          create: { phone: from.replace(/\D/g, ''), reason: `auto: "${matched}"` }
         })
-
-        if (recentLog && !recentLog.has_reply) {
-          await this.prisma.campaign_logs.update({
-            where: { id: recentLog.id },
-            data: { has_reply: true, replied_at: new Date() }
-          })
-
-          // Emitir al frontend en vivo
-          this.io.emit('campaign_reply', {
-            campaign_id: recentLog.campaign_id,
-            phone: from,
-            message: msg.message?.conversation || msg.message?.extendedTextMessage?.text || '',
-            timestamp: new Date()
-          })
-        }
+        console.log(`🚫 Auto-blacklist: ${from} por keyword "${matched}"`)
+        // Emitir evento para que el frontend se entere
+        this.io.emit('auto_blacklist', { phone: from, keyword: matched, timestamp: new Date() })
       }
+    } catch (e) {
+      console.error('Auto-blacklist error:', e)
+    }
+
+    // ─── REPLY TRACKING (campana reciente) ───
+    const recentLog = await this.prisma.campaign_logs.findFirst({
+      where: {
+        contact_phone: from,
+        status: 'sent',
+        created_at: { gte: new Date(Date.now() - 30 * 86400000) }
+      },
+      orderBy: { created_at: 'desc' }
     })
+
+    if (recentLog && !recentLog.has_reply) {
+      await this.prisma.campaign_logs.update({
+        where: { id: recentLog.id },
+        data: { has_reply: true, replied_at: new Date() }
+      })
+
+      this.io.emit('campaign_reply', {
+        campaign_id: recentLog.campaign_id,
+        phone: from,
+        message: messageBody,
+        timestamp: new Date()
+      })
+    }
+  }
+})
 
     // 4. Delivery & Read receipts: TRACKING DE APERTURA
     waClient.ev.on('messages.update', async (updates) => {
@@ -410,6 +430,32 @@ async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
   let lineaIndex = 0
   const lineasCaidas = new Set()
    let lastDelayMs = 0
+
+
+   // Dentro de sendCampaign(), antes de enviar cada mensaje:
+for (const target of targets) {
+  // ─── SKIP BLACKLIST ───
+  if (options.skipBlacklist) {
+    const blacklisted = await this.prisma.blacklist.findUnique({
+      where: { phone: target.phone.replace(/\D/g, '') }
+    })
+    if (blacklisted) {
+      console.log(`⛔ Saltando ${target.phone} — blacklist`)
+      await this.prisma.campaign_logs.create({
+        data: {
+          campaign_id: campaignId,
+          contact_phone: target.phone,
+          status: 'skipped_blacklist',
+          line_id: lineaActual?.id,
+          owner_id: options.ownerId || null,
+        }
+      })
+      continue // NO enviar
+    }
+  }
+
+  // ... acá va el envío real (sendMessage, delay, etc.)
+}
 
   for (let i = 0; i < targets.length; i++) {
     const target = targets[i]

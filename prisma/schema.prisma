@@ -34,9 +34,9 @@ model usuarios {
   // Recuperación
   reset_token          String?
   reset_token_expires  DateTime?
-  recovery_code        String?  // bcrypt hash del código de emergencia
+  recovery_code        String?
 
-  // Relaciones inversas (datos huérfanos onDelete: SetNull)
+  // Relaciones
   lineas       lineas_whatsapp[]
   campaigns    campaigns[]
   scheduled    scheduled_campaigns[]
@@ -47,20 +47,18 @@ model usuarios {
   templates    message_templates[]
   blacklists   blacklist[]
   openai       openai_config[]
-
-  
 }
 
 model leads {
-  id            String   @id @default(uuid())
-  nombre        String
-  email         String
-  company_name  String?
-  phone         String?
-  industry      String?
+  id              String   @id @default(uuid())
+  nombre          String
+  email           String
+  company_name    String?
+  phone           String?
+  industry        String?
   expected_volume String?
-  timezone      String?
-  created_at    DateTime @default(now())
+  timezone        String?
+  created_at      DateTime @default(now())
 }
 
 model app_config {
@@ -77,11 +75,14 @@ model lineas_whatsapp {
   
   owner_id        String?
   owner           usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+
+  @@index([owner_id])
+  @@index([status])
 }
 
 model campaigns {
-  id                String   @id
-  name              String
+  id                String   @id @default(uuid())  // ← FIX 1: safety net
+  name              String?                        // ← FIX 2: nullable para que no explote
   line_id           String?
   message           String
   image_url         String?
@@ -101,6 +102,8 @@ model campaigns {
 
   @@index([created_at])
   @@index([status])
+  @@index([owner_id])
+  @@index([owner_id, status])
 }
 
 model scheduled_campaigns {
@@ -112,6 +115,9 @@ model scheduled_campaigns {
 
   owner_id    String?
   owner       usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+
+  @@index([execute_at, status])  // ← FIX 3: polling eficiente
+  @@index([owner_id])
 }
 
 model campaign_attachments {
@@ -123,6 +129,9 @@ model campaign_attachments {
 
   owner_id    String?
   owner       usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+
+  @@index([campaign_id])
+  @@index([owner_id])
 }
 
 model campaign_logs {
@@ -146,6 +155,8 @@ model campaign_logs {
   @@index([campaign_id])
   @@index([contact_phone])
   @@index([created_at])
+  @@index([owner_id])
+  @@index([line_id])
 }
 
 model contacts {
@@ -162,16 +173,22 @@ model contacts {
 
   owner_id  String?
   owner     usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+
+  @@index([owner_id])
+  @@index([phone])
 }
 
 model tags {
   id     String @id @default(uuid())
-  name   String @unique
+  name   String
   color  String @default("#3B82F6")
   icon   String?
 
   owner_id String?
   owner    usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+
+  @@unique([owner_id, name])  // ← FIX 4: multi-tenancy real de tags
+  @@index([owner_id])
 }
 
 model message_templates {
@@ -185,16 +202,23 @@ model message_templates {
 
   owner_id   String?
   owner      usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+
+  @@index([owner_id])
+  @@index([category])
 }
 
 model blacklist {
   id        String   @id @default(uuid())
-  phone     String   @unique
+  phone     String
   reason    String?
   createdAt DateTime @default(now())
 
   owner_id  String?
   owner     usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+
+  @@unique([owner_id, phone])  // ← FIX 5: mismo número puede estar en blacklist de distintos usuarios
+  @@index([owner_id])
+  @@index([phone])
 }
 
 model openai_config {
@@ -207,4 +231,7 @@ model openai_config {
   updatedAt DateTime @updatedAt
 
   owner     usuarios @relation(fields: [owner_id], references: [id], onDelete: Cascade)
+
+  @@index([owner_id])
+  @@index([active])
 }

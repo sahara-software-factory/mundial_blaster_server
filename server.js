@@ -188,6 +188,7 @@ const TIER_LIMITS = {
     hasHumanMode: false,
     hasClone: false,
     hasAdvancedSpintax: false,
+    hasBlacklist: false,
     hasTemplateVars: false,
     hasAI: false,
     hasMultiUser: false,
@@ -206,6 +207,7 @@ const TIER_LIMITS = {
     hasClone: true,
     hasAdvancedSpintax: true,
     hasTemplateVars: true,
+    hasBlacklist: false,
     hasAI: false,
     hasMultiUser: false,
   },
@@ -685,8 +687,8 @@ app.get('/api/auth/check', async (req, res) => {
 app.get('/api/contacts', authOrSecret, async (req, res) => {
   try {
     const { search, tag } = req.query
-    const where = {}
-    
+    const where = { owner_id: req.user?.id } // ← filtrar por owner si es multitenancy
+
     if (search) {
       where.OR = [
         { name: { contains: search, mode: 'insensitive' } },
@@ -697,12 +699,23 @@ app.get('/api/contacts', authOrSecret, async (req, res) => {
     if (tag) {
       where.tags = { has: tag }
     }
-    
-    const contacts = await prisma.contacts.findMany({
-      where,
-      orderBy: { createdAt: 'desc' }
-    })
-    res.json({ contacts })
+
+    const [contacts, blacklistRows] = await Promise.all([
+      prisma.contacts.findMany({ where, orderBy: { createdAt: 'desc' } }),
+      prisma.blacklist.findMany({ 
+        where: { owner_id: req.user?.id }, // ← si tenés owner en blacklist
+        select: { phone: true } 
+      })
+    ])
+
+    const blacklistedPhones = new Set(blacklistRows.map(b => b.phone))
+
+    const enriched = contacts.map(c => ({
+      ...c,
+      isBlacklisted: blacklistedPhones.has(c.phone?.replace(/\D/g, ''))
+    }))
+
+    res.json({ contacts: enriched })
   } catch (e) {
     console.error('Error listando contactos:', e)
     res.status(500).json({ error: 'Error listando contactos' })
@@ -1566,8 +1579,30 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       delayMin: body.delay_min || 8000,
       delayMax: body.delay_max || 15000,
       imageUrl: body.image_url || null,
-      humanMode: body.human_mode === true  
+      humanMode: body.human_mode === true,
+      skipBlacklist: body.skipBlacklist === true,
+      ownerId: req.user?.id 
     }
+
+    if (req.body.skipBlacklist) {
+  const blacklisted = await prisma.blacklist.findUnique({
+    where: { phone: target.phone.replace(/\D/g, '') }
+  })
+  if (blacklisted) {
+    console.log(`⛔ Saltando ${target.phone} — está en blacklist`)
+    skippedCount++
+    // Opcional: guardar log como "skipped_blacklist"
+    await prisma.campaign_logs.create({
+      data: {
+        campaign_id: campaign.id,
+        contact_phone: target.phone,
+        status: 'skipped_blacklist',
+        owner_id: req.user.id,
+      }
+    })
+    continue // No enviar
+  }
+}
 
     waService.sendCampaign(newCampaign.id, lineasSeleccionadas, body.targets, body.message.trim(), sendOptions)
       .then(() => console.log(`✅ Campaña ${newCampaign.id} finalizada`))
@@ -1849,6 +1884,33 @@ app.get('/api/blacklist', authOrSecret, loadTier, requireFeature('hasBlacklist')
     res.json({ blacklist: list })
   } catch (e) {
     res.status(500).json({ error: 'Error listando blacklist' })
+  }
+})
+
+
+// GET /api/blacklist/keywords
+app.get('/api/blacklist/keywords', authOrSecret, async (req, res) => {
+  try {
+    const config = await prisma.app_config.findUnique({ where: { key: 'blacklist_keywords' } })
+    const keywords = config?.value ? JSON.parse(config.value) : ['basta', 'no molesten', 'no me interesa', 'no, gracias', 'eliminar', 'stop', 'No quiero que me envien mas info', 'no quiero que me envien mas mensajes']
+    res.json({ keywords })
+  } catch (e) {
+    res.status(500).json({ error: 'Error leyendo keywords' })
+  }
+})
+
+// POST /api/blacklist/keywords
+app.post('/api/blacklist/keywords', authOrSecret, loadTier, requireFeature('hasBlacklist'), async (req, res) => {
+  try {
+    const { keywords } = req.body // array de strings
+    await prisma.app_config.upsert({
+      where: { key: 'blacklist_keywords' },
+      update: { value: JSON.stringify(keywords) },
+      create: { key: 'blacklist_keywords', value: JSON.stringify(keywords) }
+    })
+    res.json({ success: true, keywords })
+  } catch (e) {
+    res.status(500).json({ error: 'Error guardando keywords' })
   }
 })
 
