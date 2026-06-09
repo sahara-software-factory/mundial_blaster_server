@@ -1909,7 +1909,7 @@ app.post('/api/affiliate/generate', requireAuth, async (req, res) => {
 
 
 // server.js — endpoint leads/capture
-const LEAD_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbyhfi641UqLoyRqDuZRiapP5L3XqtGbivxTj2WlooA8aBmZ9JXHdN842t53TjHOm9WlrA/exec"
+const LEAD_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwG_edNS3bOwoKSOUUK6oY-n4Dqk3h1qBsYvKFSpgqrjpvWYxBqeX-KcwtMhvbYjGB9sg/exec"
 
 app.post('/api/leads/capture', async (req, res) => {
   try {
