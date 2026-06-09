@@ -47,6 +47,20 @@ model usuarios {
   templates    message_templates[]
   blacklists   blacklist[]
   openai       openai_config[]
+
+  
+}
+
+model leads {
+  id            String   @id @default(uuid())
+  nombre        String
+  email         String
+  company_name  String?
+  phone         String?
+  industry      String?
+  expected_volume String?
+  timezone      String?
+  created_at    DateTime @default(now())
 }
 
 model app_config {

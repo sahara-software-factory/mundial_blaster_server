@@ -1915,53 +1915,68 @@ app.post('/api/affiliate/generate', requireAuth, async (req, res) => {
 
 
 // server.js — endpoint leads/capture
-const LEAD_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwG_edNS3bOwoKSOUUK6oY-n4Dqk3h1qBsYvKFSpgqrjpvWYxBqeX-KcwtMhvbYjGB9sg/exec"
+const LEAD_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycby7QcHgrT6_LJZAv_Z4kw12Hn0Hsvg9r-cxBIucSN9In69KwlL1JdDTOjYJzjAxedFWTQ/exec"
 
 app.post('/api/leads/capture', async (req, res) => {
   try {
-    const { nombre, email, company_name, phone, industry, expected_volume, timezone, fecha } = req.body
+    const { nombre, email, company_name, phone, industry, expected_volume, timezone, fecha, user_id } = req.body
     console.log('📥 Lead recibido:', { nombre, email, company_name })
 
-    if (!LEAD_SHEET_WEBHOOK_URL) {
-      console.warn('⚠️ LEAD_SHEET_WEBHOOK_URL no definida')
-      return res.json({ success: true, warning: 'Webhook no configurado' })
-    }
-
-    // Construir URL con params
-    const url = new URL(LEAD_SHEET_WEBHOOK_URL)
-    url.searchParams.set("nombre", nombre || "")
-    url.searchParams.set("email", email || "")
-    url.searchParams.set("company_name", company_name || "")
-    url.searchParams.set("phone", phone || "")
-    url.searchParams.set("industry", industry || "")
-    url.searchParams.set("expected_volume", expected_volume || "")
-    url.searchParams.set("timezone", timezone || "")
-    url.searchParams.set("fecha", fecha || new Date().toISOString())
-
-    console.log('📤 Enviando a Sheet:', url.toString())
-
-    // fetch con redirect follow (default en Node 18+)
-    const sheetRes = await fetch(url.toString(), {
-      method: 'GET',
-      redirect: 'follow',
+    // 1. GUARDAR EN POSTGRESQL (siempre funciona)
+    const lead = await prisma.leads.create({
+      data: {
+        nombre,
+        email,
+        company_name: company_name || null,
+        phone: phone || null,
+        industry: industry || null,
+        expected_volume: expected_volume || null,
+        timezone: timezone || null,
+        user_id: user_id || null,
+      }
     })
+    console.log('✅ Lead guardado en DB:', lead.id)
 
-    const responseText = await sheetRes.text()
-    console.log('📡 Sheet response status:', sheetRes.status)
-    console.log('📡 Sheet response body:', responseText)
+    // 2. INTENTAR GOOGLE SHEET (opcional, no crítico)
+    if (LEAD_SHEET_WEBHOOK_URL) {
+      try {
+        const params = new URLSearchParams()
+        params.append("nombre", nombre || "")
+        params.append("email", email || "")
+        params.append("company_name", company_name || "")
+        params.append("phone", phone || "")
+        params.append("industry", industry || "")
+        params.append("expected_volume", expected_volume || "")
+        params.append("timezone", timezone || "")
+        params.append("fecha", fecha || new Date().toISOString())
 
-    let sheetData
-    try {
-      sheetData = JSON.parse(responseText)
-    } catch {
-      sheetData = { raw: responseText }
+        // Usar POST en vez de GET
+        const sheetRes = await fetch(LEAD_SHEET_WEBHOOK_URL, {
+          method: 'POST',
+          body: params,
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          redirect: 'follow',
+        })
+
+        const responseText = await sheetRes.text()
+        console.log('📡 Sheet status:', sheetRes.status)
+        
+        // Si la respuesta empieza con <, es HTML (error)
+        if (responseText.trim().startsWith('<')) {
+          console.warn('⚠️ Sheet devolvió HTML (no JSON). URL incorrecta o no autorizado.')
+        } else {
+          console.log('✅ Sheet respondió:', responseText.substring(0, 100))
+        }
+      } catch (sheetError) {
+        console.warn('⚠️ Sheet falló (no crítico):', sheetError.message)
+      }
     }
 
-    res.json({ success: true, sheetResponse: sheetData })
+    res.json({ success: true, lead_id: lead.id, sheet_attempted: !!LEAD_SHEET_WEBHOOK_URL })
 
   } catch (e) {
     console.error('❌ Lead capture error:', e)
-    res.status(500).json({ error: 'Error guardando lead', detail: e.message })
+    res.status(500).json({ error: 'Error guardando lead' })
   }
 })
 
