@@ -253,36 +253,74 @@ class WAService {
     else if (remoteJid?.includes('@lid')) {
       detectedLid = remoteJid.split('@')[0];
       
-      // Truco A: Buscar en Participant (a veces viene aquí en chats 1 a 1)
+      // Truco A: Buscar en Participant
       if (msg.key.participant && msg.key.participant.includes('@s.whatsapp.net')) {
           fromPhone = this.cleanJid(msg.key.participant);
       }
-      // Truco B: Buscar en remoteJidAlt (El clásico de Sahara One)
+      // Truco B: Buscar en remoteJidAlt
       else if (msg.key.remoteJidAlt && msg.key.remoteJidAlt.includes('@s.whatsapp.net')) {
           fromPhone = this.cleanJid(msg.key.remoteJidAlt);
       }
-      // Truco C: Buscar en el cuerpo del mensaje (Metadatos extendidos)
+      // Truco C: Buscar en el cuerpo del mensaje
       else if (msg.message?.extendedTextMessage?.contextInfo?.participant) {
           fromPhone = this.cleanJid(msg.message.extendedTextMessage.contextInfo.participant);
       }
     }
 
-    // 3. Si todos los trucos fallaron, recurrimos a la función tradicional (Caché/BD)
+    // 3. Fallback tradicional (Caché/BD)
     if (!fromPhone) {
       fromPhone = await this.resolvePhoneFromJid(lineId, remoteJid);
     }
 
-    // 4. ¿Seguimos sin número? Fin del juego para este mensaje.
-    if (!fromPhone) {
-      console.log(`⚠️ No se pudo resolver JID (ni con trucos): ${remoteJid}`);
-      continue;
+    // ==========================================
+    // 🔫 ARMAS SECRETAS (Si todo lo anterior falló)
+    // ==========================================
+
+    // Arma 1: Interrogamos al servidor de Meta
+    if (!fromPhone && detectedLid) {
+      try {
+        console.log(`🔍 Consultando a Meta directamente por el LID: ${detectedLid}...`);
+        const [waResult] = await waClient.onWhatsApp(detectedLid);
+        
+        if (waResult && waResult.jid) {
+          fromPhone = this.cleanJid(waResult.jid);
+          console.log(`🤯 ¡Magia! Meta nos confesó el número real: ${fromPhone}`);
+        }
+      } catch (e) {
+        // Silencioso
+      }
+    }
+
+    // Arma 2: El rastro de migas (Mensaje Citado)
+    if (!fromPhone && detectedLid) {
+      const quotedMsgId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
+      
+      if (quotedMsgId) {
+        // Buscamos en nuestra BD a quién le enviamos ESTE mensaje
+        const logAnterior = await this.prisma.campaign_logs.findFirst({
+          where: { message_id: quotedMsgId }
+        });
+
+        if (logAnterior && logAnterior.contact_phone) {
+          fromPhone = logAnterior.contact_phone;
+          console.log(`🎯 ¡LID cazado por el mensaje citado!: ${detectedLid} -> ${fromPhone}`);
+        }
+      }
+    }
+
+    // ==========================================
+    // 🛑 FILTRO FINAL (El "Fin del juego")
+    // ==========================================
+    if (!fromPhone || fromPhone.includes('lid') || fromPhone.length > 15) {
+      console.log(`⚠️ Mensaje descartado: No se pudo resolver JID a pesar de las armas: ${remoteJid}`);
+      continue; // Abortamos la ejecución de este mensaje
     }
 
     // ==========================================
     // 🔗 AUTO-SANACIÓN DEL DICCIONARIO
     // ==========================================
     try {
-      // Si descubrimos un LID nuevo y su número real, lo guardamos para el futuro
+      // Guardamos la relación en BD para la próxima vez
       if (detectedLid && fromPhone) {
         this.lidCache.set(`${lineId}:${detectedLid}`, fromPhone);
         await this.prisma.lid_mappings.upsert({
@@ -290,7 +328,6 @@ class WAService {
           update: { phone: fromPhone, updatedAt: new Date() },
           create: { lineId, lid: detectedLid, phone: fromPhone }
         }).catch(() => {});
-        console.log(`🔗 LID rescatado al recibir: ${detectedLid} → ${fromPhone}`);
       }
     } catch (e) {
       console.error('Error guardando LID en BD:', e);
@@ -693,29 +730,26 @@ async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
         .replace(/\{\{telefono\}\}/gi, target.phone || '')
         .replace(/\{telefono\}/gi, target.phone || '')
 
-      const sendOptions = {
-        type: imageUrl ? 'image' : 'text',
-        imageUrl
-      }
+      const sendOptions = { type: imageUrl ? 'image' : 'text', imageUrl }
+      let sentMsg; // Creamos la variable
+      
       if (options.humanMode) {
-        await this.sendMessageHuman(lineaAsignada.id, target.phone, personalized, sendOptions)
+        sentMsg = await this.sendMessageHuman(lineaAsignada.id, target.phone, personalized, sendOptions)
       } else {
-        await this.sendMessage(lineaAsignada.id, target.phone, personalized, sendOptions)
+        // Modifica tu sendMessage para que devuelva el mensaje enviado
+        sentMsg = await this.sendMessage(lineaAsignada.id, target.phone, personalized, sendOptions)
       }
 
-      results.push({ phone: target.phone, status: 'sent', lineId: lineaAsignada.id, index: i })
-
-      await this.prisma.campaigns.update({
-        where: { id: campaignId },
-        data: { sent: { increment: 1 } }
-      }).catch(() => {})
+      // ¡AQUÍ ESTÁ LA MAGIA! Guardamos el ID del mensaje
+      const exactMessageId = sentMsg?.key?.id;
 
       await this.prisma.campaign_logs.create({
         data: {
           campaign_id: campaignId,
           line_id: lineaAsignada.id,
           contact_phone: target.phone,
-          status: 'sent'
+          status: 'sent',
+          message_id: exactMessageId // 🔥 Guardamos el ID para el futuro
         }
       }).catch(() => {})
 
