@@ -237,100 +237,61 @@ class WAService {
     if (!msg.message || msg.key.fromMe) continue
 
     const messageBody = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
-    const remoteJid = msg.key.remoteJid;
-
+    
     // ==========================================
-    // 🧠 EL RESCATE DEL NÚMERO REAL (Anti-LID)
+    // 🧠 EL RESCATE DEL NÚMERO REAL (Patrón Sahara One)
     // ==========================================
+    const raw = msg.key.remoteJid;
+    const alt = msg.key.remoteJidAlt; // 🔑 LA MAGIA — WhatsApp manda ambos en el mismo paquete
+    
     let fromPhone = null;
-    let detectedLid = null;
+    let lidDetectado = null;
 
-    // 1. Verificamos si el JID principal ya es un número limpio
-    if (remoteJid?.includes('@s.whatsapp.net')) {
-      fromPhone = this.cleanJid(remoteJid);
-    } 
-    // 2. ¡ES UN LID! Hay que buscar el número escondido.
-    else if (remoteJid?.includes('@lid')) {
-      detectedLid = remoteJid.split('@')[0];
-      
-      // Truco A: Buscar en Participant
-      if (msg.key.participant && msg.key.participant.includes('@s.whatsapp.net')) {
-          fromPhone = this.cleanJid(msg.key.participant);
-      }
-      // Truco B: Buscar en remoteJidAlt
-      else if (msg.key.remoteJidAlt && msg.key.remoteJidAlt.includes('@s.whatsapp.net')) {
-          fromPhone = this.cleanJid(msg.key.remoteJidAlt);
-      }
-      // Truco C: Buscar en el cuerpo del mensaje
-      else if (msg.message?.extendedTextMessage?.contextInfo?.participant) {
-          fromPhone = this.cleanJid(msg.message.extendedTextMessage.contextInfo.participant);
-      }
+    // Paso 1: Leer ambos campos del mensaje a la vez
+    if (raw?.includes('@s.whatsapp.net')) {
+        fromPhone = raw.split('@')[0].replace(/\D/g, '');
+    } else if (raw?.includes('@lid')) {
+        lidDetectado = raw.split('@')[0];
+    }
+    
+    if (alt?.includes('@s.whatsapp.net')) {
+        fromPhone = alt.split('@')[0].replace(/\D/g, '');
+    } else if (alt?.includes('@lid') && !lidDetectado) {
+        lidDetectado = alt.split('@')[0];
     }
 
-    // 3. Fallback tradicional (Caché/BD)
+    // Paso 2: AUTO-SANACIÓN — Si el mensaje trajo ambos, curar la BD en el momento
+    if (fromPhone && lidDetectado) {
+      this.lidCache.set(`${lineId}:${lidDetectado}`, fromPhone);
+      await this.prisma.lid_mappings.upsert({
+        where: { lineId_lid: { lineId, lid: lidDetectado } },
+        update: { phone: fromPhone, updatedAt: new Date() },
+        create: { lineId, lid: lidDetectado, phone: fromPhone }
+      }).catch(() => {});
+      console.log(`🩺 Auto-sanación instantánea: ${lidDetectado} → ${fromPhone}`);
+    }
+
+    // Paso 3: Si solo tenemos LID (remoteJidAlt no vino), buscar en caché/BD
+    if (!fromPhone && lidDetectado) {
+      fromPhone = await this.resolvePhoneFromJid(lineId, `${lidDetectado}@lid`);
+    }
+
+    // Paso 4: ÚLTIMO RECURSO — Usar el LID limpio como ID temporal
+    // El mensaje NO se descarta. Cuando llegue otro mensaje con remoteJidAlt, o enviemos uno, se reconcilia solo.
+    if (!fromPhone && lidDetectado) {
+      fromPhone = lidDetectado;
+      console.log(`⚠️ LID sin resolver aún, usando como ID temporal: ${lidDetectado}`);
+    }
+
+    // 🛑 FILTRO FINAL: Si no tenemos absolutamente nada, abortar.
     if (!fromPhone) {
-      fromPhone = await this.resolvePhoneFromJid(lineId, remoteJid);
+      console.log(`⚠️ JID irresoluble (incluso sin LID temporal): ${raw}`);
+      continue;
     }
 
-    // ==========================================
-    // 🔫 ARMAS SECRETAS (Si todo lo anterior falló)
-    // ==========================================
-
-    // Arma 1: Interrogamos al servidor de Meta
-    if (!fromPhone && detectedLid) {
-      try {
-        console.log(`🔍 Consultando a Meta directamente por el LID: ${detectedLid}...`);
-        const [waResult] = await waClient.onWhatsApp(detectedLid);
-        
-        if (waResult && waResult.jid) {
-          fromPhone = this.cleanJid(waResult.jid);
-          console.log(`🤯 ¡Magia! Meta nos confesó el número real: ${fromPhone}`);
-        }
-      } catch (e) {
-        // Silencioso
-      }
-    }
-
-    // Arma 2: El rastro de migas (Mensaje Citado)
-    if (!fromPhone && detectedLid) {
-      const quotedMsgId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
-      
-      if (quotedMsgId) {
-        // Buscamos en nuestra BD a quién le enviamos ESTE mensaje
-        const logAnterior = await this.prisma.campaign_logs.findFirst({
-          where: { message_id: quotedMsgId }
-        });
-
-        if (logAnterior && logAnterior.contact_phone) {
-          fromPhone = logAnterior.contact_phone;
-          console.log(`🎯 ¡LID cazado por el mensaje citado!: ${detectedLid} -> ${fromPhone}`);
-        }
-      }
-    }
-
-    // ==========================================
-    // 🛑 FILTRO FINAL (El "Fin del juego")
-    // ==========================================
-    if (!fromPhone || fromPhone.includes('lid') || fromPhone.length > 15) {
-      console.log(`⚠️ Mensaje descartado: No se pudo resolver JID a pesar de las armas: ${remoteJid}`);
-      continue; // Abortamos la ejecución de este mensaje
-    }
-
-    // ==========================================
-    // 🔗 AUTO-SANACIÓN DEL DICCIONARIO
-    // ==========================================
-    try {
-      // Guardamos la relación en BD para la próxima vez
-      if (detectedLid && fromPhone) {
-        this.lidCache.set(`${lineId}:${detectedLid}`, fromPhone);
-        await this.prisma.lid_mappings.upsert({
-          where: { lineId_lid: { lineId, lid: detectedLid } },
-          update: { phone: fromPhone, updatedAt: new Date() },
-          create: { lineId, lid: detectedLid, phone: fromPhone }
-        }).catch(() => {});
-      }
-    } catch (e) {
-      console.error('Error guardando LID en BD:', e);
+    // Actualizar caché preventivamente (si fromPhone vino del Paso 3)
+    if (lidDetectado && fromPhone && fromPhone !== lidDetectado) {
+      this.lidCache.set(`${lineId}:${lidDetectado}`, fromPhone);
     }
 
     // ─── AUTO BLACKLIST ───
