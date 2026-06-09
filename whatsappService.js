@@ -237,27 +237,64 @@ class WAService {
     if (!msg.message || msg.key.fromMe) continue
 
     const messageBody = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
+    const remoteJid = msg.key.remoteJid;
 
-    // ─── RESOLVER NÚMERO REAL (como Sahara One) ───
-    const fromPhone = await this.resolvePhoneFromJid(lineId, msg.key.remoteJid)
-    
-    if (!fromPhone) {
-      console.log(`⚠️ No se pudo resolver JID: ${msg.key.remoteJid}`)
-      continue
+    // ==========================================
+    // 🧠 EL RESCATE DEL NÚMERO REAL (Anti-LID)
+    // ==========================================
+    let fromPhone = null;
+    let detectedLid = null;
+
+    // 1. Verificamos si el JID principal ya es un número limpio
+    if (remoteJid?.includes('@s.whatsapp.net')) {
+      fromPhone = this.cleanJid(remoteJid);
+    } 
+    // 2. ¡ES UN LID! Hay que buscar el número escondido.
+    else if (remoteJid?.includes('@lid')) {
+      detectedLid = remoteJid.split('@')[0];
+      
+      // Truco A: Buscar en Participant (a veces viene aquí en chats 1 a 1)
+      if (msg.key.participant && msg.key.participant.includes('@s.whatsapp.net')) {
+          fromPhone = this.cleanJid(msg.key.participant);
+      }
+      // Truco B: Buscar en remoteJidAlt (El clásico de Sahara One)
+      else if (msg.key.remoteJidAlt && msg.key.remoteJidAlt.includes('@s.whatsapp.net')) {
+          fromPhone = this.cleanJid(msg.key.remoteJidAlt);
+      }
+      // Truco C: Buscar en el cuerpo del mensaje (Metadatos extendidos)
+      else if (msg.message?.extendedTextMessage?.contextInfo?.participant) {
+          fromPhone = this.cleanJid(msg.message.extendedTextMessage.contextInfo.participant);
+      }
     }
 
-    // ─── LID MAPPING: guardar si Baileys nos dio un LID mapeado ───
+    // 3. Si todos los trucos fallaron, recurrimos a la función tradicional (Caché/BD)
+    if (!fromPhone) {
+      fromPhone = await this.resolvePhoneFromJid(lineId, remoteJid);
+    }
+
+    // 4. ¿Seguimos sin número? Fin del juego para este mensaje.
+    if (!fromPhone) {
+      console.log(`⚠️ No se pudo resolver JID (ni con trucos): ${remoteJid}`);
+      continue;
+    }
+
+    // ==========================================
+    // 🔗 AUTO-SANACIÓN DEL DICCIONARIO
+    // ==========================================
     try {
-      if (msg.key.remoteJid?.includes('@lid') && fromPhone) {   // ← guard `&& fromPhone`
-        const lidClean = msg.key.remoteJid.split('@')[0]
-        this.lidCache.set(`${lineId}:${lidClean}`, fromPhone)   // ← también popular caché
+      // Si descubrimos un LID nuevo y su número real, lo guardamos para el futuro
+      if (detectedLid && fromPhone) {
+        this.lidCache.set(`${lineId}:${detectedLid}`, fromPhone);
         await this.prisma.lid_mappings.upsert({
-          where: { lineId_lid: { lineId, lid: lidClean } },
+          where: { lineId_lid: { lineId, lid: detectedLid } },
           update: { phone: fromPhone, updatedAt: new Date() },
-          create: { lineId, lid: lidClean, phone: fromPhone }
-        }).catch(() => {})
+          create: { lineId, lid: detectedLid, phone: fromPhone }
+        }).catch(() => {});
+        console.log(`🔗 LID rescatado al recibir: ${detectedLid} → ${fromPhone}`);
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error('Error guardando LID en BD:', e);
+    }
 
     // ─── AUTO BLACKLIST ───
     try {
