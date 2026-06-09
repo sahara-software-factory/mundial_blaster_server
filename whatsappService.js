@@ -236,31 +236,51 @@ class WAService {
 
     const messageBody = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
 
-    // ─── AUTO BLACKLIST: verificar palabras clave ───
+       // ─── AUTO BLACKLIST: verificar palabras clave ───
     try {
+      const cleanFrom = this.cleanJid(msg.key.remoteJid) // ← USA EL MÉTODO QUE YA TENÉS
+      if (!cleanFrom) continue
+
       const config = await this.prisma.app_config.findUnique({ where: { key: 'blacklist_keywords' } })
       const keywords = config?.value ? JSON.parse(config.value) : ['basta', 'no molesten', 'no me interesa', 'no, gracias', 'eliminar', 'stop', 'darme de baja']
       const lowerBody = messageBody.toLowerCase()
       const matched = keywords.find(k => lowerBody.includes(k.toLowerCase()))
 
       if (matched) {
-        await this.prisma.blacklist.upsert({
-          where: { phone: from.replace(/\D/g, '') },
-          update: { reason: `auto: "${matched}"` },
-          create: { phone: from.replace(/\D/g, ''), reason: `auto: "${matched}"` }
+        // findFirst + create/update evita el drama del upsert con compound unique
+        const existing = await this.prisma.blacklist.findFirst({
+          where: { phone: cleanFrom }
         })
-        console.log(`🚫 Auto-blacklist: ${from} por keyword "${matched}"`)
-        // Emitir evento para que el frontend se entere
-        this.io.emit('auto_blacklist', { phone: from, keyword: matched, timestamp: new Date() })
+
+        if (existing) {
+          await this.prisma.blacklist.update({
+            where: { id: existing.id },
+            data: { reason: `auto: "${matched}"` }
+          })
+        } else {
+          await this.prisma.blacklist.create({
+            data: {
+              phone: cleanFrom,
+              reason: `auto: "${matched}"`,
+              owner_id: null
+            }
+          })
+        }
+
+        console.log(`🚫 Auto-blacklist: ${cleanFrom} por keyword "${matched}"`)
+        this.io.emit('auto_blacklist', { phone: cleanFrom, keyword: matched, timestamp: new Date() })
       }
     } catch (e) {
       console.error('Auto-blacklist error:', e)
     }
 
-    // ─── REPLY TRACKING (campana reciente) ───
+       // ─── REPLY TRACKING (campana reciente) ───
+    const cleanFrom = this.cleanJid(msg.key.remoteJid) // ← REEMPLAZAR la línea anterior
+    if (!cleanFrom) continue // ← AGREGAR este guard
+
     const recentLog = await this.prisma.campaign_logs.findFirst({
       where: {
-        contact_phone: from,
+        contact_phone: cleanFrom, // ← USAR cleanFrom acá también
         status: 'sent',
         created_at: { gte: new Date(Date.now() - 30 * 86400000) }
       },
