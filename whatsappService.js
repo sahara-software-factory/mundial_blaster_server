@@ -5,6 +5,8 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  jidDecode,           
+  jidNormalizedUser
 } = require('@whiskeysockets/baileys')
 const pino = require('pino')
 const fs = require('fs-extra')
@@ -235,55 +237,28 @@ class WAService {
 
     const messageBody = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
 
-    // ─── LID MAPPING: alimentar tabla si llega número real ───
-    try {
-      const rawJid = msg.key.remoteJid
-      const altJid = msg.key.remoteJidAlt
-      
-      // Solo si tenemos AMBOS: LID + número real en el mismo mensaje
-      const lidRaw = rawJid?.includes('@lid') ? rawJid : (altJid?.includes('@lid') ? altJid : null)
-      const phoneRaw = rawJid?.includes('@s.whatsapp.net') ? rawJid : (altJid?.includes('@s.whatsapp.net') ? altJid : null)
-
-      if (lidRaw && phoneRaw) {
-        const lidClean = lidRaw.split('@')[0]
-        const phoneClean = this.cleanJid(phoneRaw)
-
-        await this.prisma.lid_mappings.upsert({
-          where: { lineId_lid: { lineId, lid: lidClean } },
-          update: { phone: phoneClean, updatedAt: new Date() },
-          create: { lineId, lid: lidClean, phone: phoneClean }
-        }).catch(() => {})
-      }
-    } catch (e) {
-      // Silencioso
+    // ─── RESOLVER NÚMERO REAL (como Sahara One) ───
+    const fromPhone = await this.resolvePhoneFromJid(lineId, msg.key.remoteJid)
+    
+    if (!fromPhone) {
+      console.log(`⚠️ No se pudo resolver JID: ${msg.key.remoteJid}`)
+      continue
     }
 
-    // ─── AUTO BLACKLIST: verificar palabras clave ───
+    // ─── LID MAPPING: guardar si Baileys nos dio un LID mapeado ───
     try {
-      const rawJid = msg.key.remoteJid
-      const altJid = msg.key.remoteJidAlt
-      
-      // Resolver LID → teléfono real
-      let fromPhone = await this.resolveLid(lineId, rawJid, altJid)
-
-      // Fallback: buscar en waClient.contacts si Baileys tiene el mapeo en memoria
-      if (!fromPhone && waClient.contacts) {
-        const lidClean = rawJid?.includes('@lid') ? rawJid.split('@')[0] : null
-        if (lidClean) {
-          const contactEntry = Object.values(waClient.contacts).find(
-            c => c.id === rawJid || c.lid === lidClean
-          )
-          if (contactEntry?.notify) {
-            fromPhone = this.cleanJid(contactEntry.notify)
-          }
-        }
+      if (msg.key.remoteJid?.includes('@lid')) {
+        const lidClean = msg.key.remoteJid.split('@')[0]
+        await this.prisma.lid_mappings.upsert({
+          where: { lineId_lid: { lineId, lid: lidClean } },
+          update: { phone: fromPhone, updatedAt: new Date() },
+          create: { lineId, lid: lidClean, phone: fromPhone }
+        }).catch(() => {})
       }
+    } catch (e) {}
 
-      if (!fromPhone || fromPhone.length < 10 || fromPhone.length > 15) {
-        console.log(`⚠️ Auto-blacklist skip: LID sin resolver (raw: ${rawJid}, alt: ${altJid})`)
-        continue
-      }
-
+    // ─── AUTO BLACKLIST ───
+    try {
       const config = await this.prisma.app_config.findUnique({ where: { key: 'blacklist_keywords' } })
       const keywords = config?.value ? JSON.parse(config.value) : ['basta', 'no molesten', 'no me interesa', 'no, gracias', 'eliminar', 'stop', 'darme de baja']
       const lowerBody = messageBody.toLowerCase()
@@ -304,11 +279,8 @@ class WAService {
       console.error('Auto-blacklist error:', e)
     }
 
-    // ─── REPLY TRACKING (campana reciente) ───
+    // ─── REPLY TRACKING ───
     try {
-      const fromPhone = await this.resolveLid(lineId, msg.key.remoteJid, msg.key.remoteJidAlt)
-      if (!fromPhone) continue
-
       const recentLog = await this.prisma.campaign_logs.findFirst({
         where: {
           contact_phone: fromPhone,
@@ -364,36 +336,52 @@ class WAService {
     })
   }
 
-  cleanJid(jid) {
+    cleanJid(jid) {
     if (!jid) return ''
     return jid.split('@')[0].split(':')[0].replace(/\D/g, '')
   }
 
-    async resolveLid(lineId, rawJid, altJid) {
-    // 1. Si ya es número real, devolverlo limpio
-    if (rawJid?.includes('@s.whatsapp.net')) {
-      return this.cleanJid(rawJid)
+  // ← PEGAR AQUÍ, debajo de cleanJid
+  decodeJid(jid) {
+    if (!jid || typeof jid !== 'string') return jid
+    try {
+      if (jid.includes(':') || jid.includes('@')) {
+        const decoded = jidDecode(jid)
+        if (decoded?.user && decoded?.server) {
+          return `${decoded.user}@${decoded.server}`
+        }
+      }
+    } catch (e) {}
+    return jid
+  }
+
+  async resolvePhoneFromJid(lineId, rawJid) {
+    if (!rawJid) return null
+
+    // Intento 1: jidDecode (como Sahara One)
+    const decoded = this.decodeJid(rawJid)
+    if (decoded?.includes('@s.whatsapp.net')) {
+      return this.cleanJid(decoded)
     }
-    if (altJid?.includes('@s.whatsapp.net')) {
-      return this.cleanJid(altJid)
+
+    // Intento 2: jidNormalizedUser (fuerza formato real)
+    try {
+      const normalized = jidNormalizedUser(rawJid)
+      if (normalized?.includes('@s.whatsapp.net')) {
+        return this.cleanJid(normalized)
+      }
+    } catch (e) {}
+
+    // Intento 3: fallback a lid_mappings si sigue siendo LID
+    if (rawJid?.includes('@lid')) {
+      const lidClean = rawJid.split('@')[0]
+      const mapping = await this.prisma.lid_mappings.findUnique({
+        where: { lineId_lid: { lineId, lid: lidClean } }
+      }).catch(() => null)
+      if (mapping?.phone) return this.cleanJid(mapping.phone)
     }
 
-    // 2. Si es LID, buscar en mapeo previo
-    const lid = rawJid?.includes('@lid') ? rawJid : (altJid?.includes('@lid') ? altJid : null)
-    if (!lid) return null
-
-    const lidClean = lid.split('@')[0]
-    
-    const mapping = await this.prisma.lid_mappings.findUnique({
-      where: { lineId_lid: { lineId, lid: lidClean } }
-    }).catch(() => null)
-
-    if (mapping?.phone) {
-      return this.cleanJid(mapping.phone)
-    }
-
-    // 3. No hay mapeo: devolver el LID limpio como fallback (para logging)
-    return lidClean
+    return null
   }
 
 
