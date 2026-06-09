@@ -632,17 +632,33 @@ app.get('/api/auth/check', async (req, res) => {
 })
 
 
-// POST /api/leads/capture — Fallback cuando Google Sheet falla
+// /api/leads/capture — ahora sí guarda en Google Sheet desde el servidor
 app.post('/api/leads/capture', async (req, res) => {
   try {
     const { nombre, email, company_name, phone, industry, expected_volume, timezone, fecha } = req.body
     
-    // Guardar en tabla de leads (si existe, o crear log)
-    console.log('📥 Lead capturado (fallback):', { nombre, email, company_name, fecha })
-    
-    // Opcional: guardar en DB si tenés tabla leads
-    // await prisma.leads.create({ data: { ... } })
-    
+    console.log('📥 Lead recibido:', { nombre, email })
+
+    // 👇 Llamada server-side: sin CORS, sin no-cors, sin problemas
+    const params = new URLSearchParams()
+    params.append("nombre", nombre || "")
+    params.append("email", email || "")
+    if (company_name) params.append("company_name", company_name)
+    if (phone) params.append("phone", phone)
+    if (industry) params.append("industry", industry)
+    if (expected_volume) params.append("expected_volume", expected_volume)
+    if (timezone) params.append("timezone", timezone)
+    params.append("fecha", fecha || new Date().toISOString())
+
+    const sheetRes = await fetch(process.env.LEAD_SHEET_WEBHOOK_URL, {
+      method: "POST",
+      body: params,
+      // Sin mode: "no-cors" — el servidor puede leer la respuesta
+    })
+
+    const sheetData = await sheetRes.json()
+    console.log("✅ Google Sheet respondió:", sheetData)
+
     res.json({ success: true })
   } catch (e) {
     console.error('Lead capture error:', e)
