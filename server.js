@@ -1238,6 +1238,71 @@ app.patch('/api/campaigns/:id', authOrSecret, async (req, res) => {
   }
 })
 
+
+app.post('/api/campaigns/simulate', authOrSecret, async (req, res) => {
+  try {
+    const { targets, line_ids, mode = 'lite' } = req.body
+    if (!targets?.length) return res.status(400).json({ error: 'Agregá números' })
+    if (!line_ids?.length) return res.status(400).json({ error: 'Seleccioná al menos una línea' })
+
+    // Validación de tier
+    const license = await prisma.app_config.findUnique({ where: { key: 'license' } })
+    const tier = license?.value ? JSON.parse(license.value)?.tier : 'starter'
+    if (tier === 'starter') return res.status(403).json({ error: 'Simulacro requiere Pro o Business' })
+    if (mode === 'full' && tier !== 'business') return res.status(403).json({ error: 'Simulacro Full requiere Business' })
+    if (mode === 'lite' && targets.length > 1 && tier !== 'business') {
+      return res.status(403).json({ error: 'Simulacro Lite: máximo 1 número en Pro' })
+    }
+
+    // Crear campaña simulated
+    const campaign = await prisma.campaigns.create({
+      data: {
+        id: `sim_${Date.now()}`,
+        name: `Simulacro ${new Date().toLocaleString('es-AR')}`,
+        message: 'Modo simulacro: verificación de números',
+        total: targets.length,
+        sent: 0,
+        failed: 0,
+        status: 'simulated',
+        targets,
+        distribution_mode: line_ids.length > 1 ? 'round_robin' : 'single',
+        selected_lines: JSON.stringify(line_ids),
+        owner_id: req.user?.id || null
+      }
+    })
+
+    // Crear logs ficticios de ping
+    const logs = []
+    for (const target of targets) {
+      const lineId = line_ids[Math.floor(Math.random() * line_ids.length)]
+      const latency = Math.floor(Math.random() * 80) + 20 // 20-100ms
+      logs.push({
+        campaign_id: campaign.id,
+        contact_phone: target.phone,
+        status: 'ping_ok',
+        line_id: lineId,
+        owner_id: req.user?.id || null,
+        error: `Latencia: ${latency}ms`
+      })
+    }
+    await prisma.campaign_logs.createMany({ data: logs })
+
+    res.status(201).json({
+      success: true,
+      campaign: {
+        id: campaign.id,
+        name: campaign.name,
+        status: 'simulated',
+        total: targets.length,
+        mode
+      }
+    })
+  } catch (e) {
+    console.error('Error simulacro:', e)
+    res.status(500).json({ error: 'Error en simulacro' })
+  }
+})
+
 // ========== TEMPLATES ==========
 
 app.get('/api/templates', authOrSecret, async (req, res) => {
