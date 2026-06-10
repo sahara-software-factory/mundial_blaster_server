@@ -47,6 +47,7 @@ model usuarios {
   templates    message_templates[]
   blacklists   blacklist[]
   openai       openai_config[]
+  ai_prompts   ai_prompts[]
 }
 
 model leads {
