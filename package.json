@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
-    "@whiskeysockets/baileys": "^6.7.22",
+    "@whiskeysockets/baileys": "7.0.0-rc13",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
