@@ -1245,34 +1245,28 @@ app.post('/api/campaigns/simulate', authOrSecret, async (req, res) => {
     if (!targets?.length) return res.status(400).json({ error: 'Agregá números' })
     if (!line_ids?.length) return res.status(400).json({ error: 'Seleccioná al menos una línea' })
 
-    // Validación de tier
     let tier = req.user?.tier || 'starter'
-    
     if (!tier || tier === 'starter') {
       const license = await prisma.app_config.findUnique({ where: { key: 'license' } })
       if (license?.value) {
         try {
-          // Intentar JSON primero
           const parsed = JSON.parse(license.value)
           tier = parsed?.tier || 'starter'
         } catch {
-          // Si es JWT, decodificar payload
           try {
             const payload = JSON.parse(Buffer.from(license.value.split('.')[1], 'base64').toString())
             tier = payload?.tier || 'starter'
-          } catch {
-            tier = 'starter'
-          }
+          } catch { tier = 'starter' }
         }
       }
     }
+    
     if (tier === 'starter') return res.status(403).json({ error: 'Simulacro requiere Pro o Business' })
     if (mode === 'full' && tier !== 'business') return res.status(403).json({ error: 'Simulacro Full requiere Business' })
     if (mode === 'lite' && targets.length > 1 && tier !== 'business') {
       return res.status(403).json({ error: 'Simulacro Lite: máximo 1 número en Pro' })
     }
 
-    // Crear campaña simulated
     const campaign = await prisma.campaigns.create({
       data: {
         id: `sim_${Date.now()}`,
@@ -1289,22 +1283,6 @@ app.post('/api/campaigns/simulate', authOrSecret, async (req, res) => {
       }
     })
 
-    // Crear logs ficticios de ping
-    const logs = []
-    for (const target of targets) {
-      const lineId = line_ids[Math.floor(Math.random() * line_ids.length)]
-      const latency = Math.floor(Math.random() * 80) + 20 // 20-100ms
-      logs.push({
-        campaign_id: campaign.id,
-        contact_phone: target.phone,
-        status: 'ping_ok',
-        line_id: lineId,
-        owner_id: req.user?.id || null,
-        error: `Latencia: ${latency}ms`
-      })
-    }
-    await prisma.campaign_logs.createMany({ data: logs })
-
     res.status(201).json({
       success: true,
       campaign: {
@@ -1318,6 +1296,31 @@ app.post('/api/campaigns/simulate', authOrSecret, async (req, res) => {
   } catch (e) {
     console.error('Error simulacro:', e)
     res.status(500).json({ error: 'Error en simulacro' })
+  }
+})
+
+// Guardar logs del simulacro al final (para reportes)
+app.post('/api/campaigns/simulate/:id/logs', authOrSecret, async (req, res) => {
+  try {
+    const { id } = req.params
+    const { logs } = req.body
+    
+    if (!Array.isArray(logs)) return res.status(400).json({ error: 'Logs inválidos' })
+
+    const data = logs.map((log) => ({
+      campaign_id: id,
+      contact_phone: log.contact_phone,
+      status: 'ping_ok',
+      line_id: log.line_id,
+      owner_id: req.user?.id || null,
+      error: `Latencia: ${log.latency}ms`
+    }))
+
+    await prisma.campaign_logs.createMany({ data })
+    res.json({ success: true, count: logs.length })
+  } catch (e) {
+    console.error('Error guardando logs simulacro:', e)
+    res.status(500).json({ error: 'Error guardando logs' })
   }
 })
 
