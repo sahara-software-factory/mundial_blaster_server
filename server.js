@@ -687,14 +687,25 @@ app.get('/api/auth/check', async (req, res) => {
 app.get('/api/contacts', authOrSecret, async (req, res) => {
   try {
     const { search, tag } = req.query
-    const where = { owner_id: req.user?.id } // ← filtrar por owner si es multitenancy
+    const where = {}
+
+    // Si hay usuario autenticado, traer propios + huérfanos (para no perder datos)
+    if (req.user?.id) {
+      where.OR = [
+        { owner_id: req.user.id },
+        { owner_id: null }
+      ]
+    }
 
     if (search) {
-      where.OR = [
-        { name: { contains: search, mode: 'insensitive' } },
-        { phone: { contains: search } },
-        { email: { contains: search, mode: 'insensitive' } },
-      ]
+      where.AND = where.AND || []
+      where.AND.push({
+        OR: [
+          { name: { contains: search, mode: 'insensitive' } },
+          { phone: { contains: search } },
+          { email: { contains: search, mode: 'insensitive' } },
+        ]
+      })
     }
     if (tag) {
       where.tags = { has: tag }
@@ -703,7 +714,7 @@ app.get('/api/contacts', authOrSecret, async (req, res) => {
     const [contacts, blacklistRows] = await Promise.all([
       prisma.contacts.findMany({ where, orderBy: { createdAt: 'desc' } }),
       prisma.blacklist.findMany({ 
-        where: { owner_id: req.user?.id }, // ← si tenés owner en blacklist
+        where: req.user?.id ? { owner_id: req.user.id } : {},
         select: { phone: true } 
       })
     ])
@@ -735,7 +746,8 @@ app.post('/api/contacts', authOrSecret, async (req, res) => {
         company,
         tags: tags || [],
         notes,
-        source: 'manual'
+        source: 'manual',
+        owner_id: req.user?.id || null  // ← AGREGAR ESTO
       }
     })
     res.json({ success: true, contact })
