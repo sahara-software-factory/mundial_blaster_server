@@ -689,7 +689,7 @@ app.get('/api/contacts', authOrSecret, async (req, res) => {
     const { search, tag } = req.query
     const where = {}
 
-    // Si hay usuario autenticado, traer propios + huérfanos (para no perder datos)
+    // Traer propios + huérfanos
     if (req.user?.id) {
       where.OR = [
         { owner_id: req.user.id },
@@ -714,16 +714,18 @@ app.get('/api/contacts', authOrSecret, async (req, res) => {
     const [contacts, blacklistRows] = await Promise.all([
       prisma.contacts.findMany({ where, orderBy: { createdAt: 'desc' } }),
       prisma.blacklist.findMany({ 
-        where: req.user?.id ? { owner_id: req.user.id } : {},
         select: { phone: true } 
       })
     ])
 
-    const blacklistedPhones = new Set(blacklistRows.map(b => b.phone))
+    // Cruzar con toda la blacklist (sin filtrar por owner)
+    const blacklistedPhones = new Set(
+      blacklistRows.map(b => String(b.phone).replace(/\D/g, ''))
+    )
 
     const enriched = contacts.map(c => ({
       ...c,
-      isBlacklisted: blacklistedPhones.has(c.phone?.replace(/\D/g, ''))
+      isBlacklisted: blacklistedPhones.has(String(c.phone).replace(/\D/g, ''))
     }))
 
     res.json({ contacts: enriched })
