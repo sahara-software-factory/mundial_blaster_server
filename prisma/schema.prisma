@@ -59,6 +59,7 @@ model leads {
   industry        String?
   expected_volume String?
   timezone        String?
+  user_id         String? 
   created_at      DateTime @default(now())
 }
 

@@ -1099,14 +1099,21 @@ app.delete('/api/campaigns/:id', authOrSecret, requireLicense, async (req, res) 
     const { id } = req.params
     const userId = req.user?.id || req.userId
 
+    // Buscar por id + owner (propia o huérfana)
     const campaign = await prisma.campaigns.findFirst({
-      where: { id, user_id: userId }
+      where: {
+        id,
+        OR: [
+          { owner_id: userId },
+          { owner_id: null }
+        ]
+      }
     })
 
     if (!campaign) return res.status(404).json({ error: 'Campaña no encontrada' })
     if (campaign.status === 'running') return res.status(400).json({ error: 'No se puede eliminar una campaña en ejecución. Parala primero.' })
 
-    // Transaction atómica: logs primero (evita FK huérfanos), luego campaña
+    // Transaction atómica: logs primero, luego campaña
     await prisma.$transaction([
       prisma.campaign_logs.deleteMany({ where: { campaign_id: id } }),
       prisma.campaigns.delete({ where: { id } })
@@ -2225,7 +2232,7 @@ app.post('/api/leads/capture', async (req, res) => {
     const { nombre, email, company_name, phone, industry, expected_volume, timezone, fecha, user_id } = req.body
     console.log('📥 Lead recibido:', { nombre, email, company_name })
 
-    // 1. GUARDAR EN POSTGRESQL (siempre funciona)
+    // 1. GUARDAR EN POSTGRESQL
     const lead = await prisma.leads.create({
       data: {
         nombre,
@@ -2235,12 +2242,12 @@ app.post('/api/leads/capture', async (req, res) => {
         industry: industry || null,
         expected_volume: expected_volume || null,
         timezone: timezone || null,
-        user_id: user_id || null,
+        user_id: user_id || null,  // ← ahora sí existe en el schema
       }
     })
     console.log('✅ Lead guardado en DB:', lead.id)
 
-    // 2. INTENTAR GOOGLE SHEET (opcional, no crítico)
+    // 2. INTENTAR GOOGLE SHEET (opcional)
     if (LEAD_SHEET_WEBHOOK_URL) {
       try {
         const params = new URLSearchParams()
@@ -2251,9 +2258,9 @@ app.post('/api/leads/capture', async (req, res) => {
         params.append("industry", industry || "")
         params.append("expected_volume", expected_volume || "")
         params.append("timezone", timezone || "")
+        params.append("user_id", user_id || "")  // ← también al sheet
         params.append("fecha", fecha || new Date().toISOString())
 
-        // Usar POST en vez de GET
         const sheetRes = await fetch(LEAD_SHEET_WEBHOOK_URL, {
           method: 'POST',
           body: params,
@@ -2264,7 +2271,6 @@ app.post('/api/leads/capture', async (req, res) => {
         const responseText = await sheetRes.text()
         console.log('📡 Sheet status:', sheetRes.status)
         
-        // Si la respuesta empieza con <, es HTML (error)
         if (responseText.trim().startsWith('<')) {
           console.warn('⚠️ Sheet devolvió HTML (no JSON). URL incorrecta o no autorizado.')
         } else {
