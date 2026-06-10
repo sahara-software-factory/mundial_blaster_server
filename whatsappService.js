@@ -337,41 +337,74 @@ class WAService {
   }
 })
 
-    // 4. Delivery & Read receipts: TRACKING DE APERTURA
-    waClient.ev.on('messages.update', async (updates) => {
+  waClient.ev.on('messages.update', async (updates) => {
       for (const update of updates) {
-        const { key, update: statusUpdate } = update
-        if (!key.id || !key.remoteJid) continue
+        const { key, update: statusUpdate } = update;
+        if (!key.id || !key.remoteJid) continue;
 
-        const phone = await this.resolvePhoneFromJid(lineId, key.remoteJid)
-if (!phone) continue
+        // ==========================================
+        // 🕵️‍♂️ CAZADOR DE LIDs (Vía Acuse de Recibo)
+        // ==========================================
+        if (key.remoteJid.includes('@lid')) {
+            const lidClean = key.remoteJid.split('@')[0];
+            
+            // Si no lo tenemos en caché, investigamos de quién es este acuse
+            if (!this.lidCache.has(`${lineId}:${lidClean}`)) {
+                try {
+                    // Buscamos a quién le enviamos ESTE mensaje exacto
+                    const logSent = await this.prisma.campaign_logs.findFirst({
+                        where: { message_id: key.id }
+                    });
 
-        // Buscar el log más reciente de este número
+                    if (logSent && logSent.contact_phone) {
+                        const realPhone = logSent.contact_phone;
+                        
+                        // ¡BINGO! Llenamos el diccionario y la BD en silencio
+                        this.lidCache.set(`${lineId}:${lidClean}`, realPhone);
+                        await this.prisma.lid_mappings.upsert({
+                            where: { lineId_lid: { lineId, lid: lidClean } },
+                            update: { phone: realPhone, updatedAt: new Date() },
+                            create: { lineId, lid: lidClean, phone: realPhone }
+                        }).catch(() => {});
+                        
+                        console.log(`🕵️‍♂️ LID mapeado por Acuse de Recibo: ${lidClean} -> ${realPhone}`);
+                    }
+                } catch (e) {
+                    console.error("Error en Cazador de LIDs:", e);
+                }
+            }
+        }
+
+        // ==========================================
+        // ─── LÓGICA DE LECTURA (Tu código original)
+        // ==========================================
+        const phone = await this.resolvePhoneFromJid(lineId, key.remoteJid);
+        if (!phone) continue;
+
         const log = await this.prisma.campaign_logs.findFirst({
-          where: { contact_phone: phone },
+          where: { contact_phone: phone, message_id: key.id }, // Mejor buscar por message_id también
           orderBy: { created_at: 'desc' }
-        })
+        });
 
-        if (!log) continue
+        if (!log) continue;
 
-        // ack: 1 = sent, 2 = delivered, 3 = read, 4 = played
-        const ack = statusUpdate?.status || statusUpdate?.ack
+        const ack = statusUpdate?.status || statusUpdate?.ack;
 
         if (ack === 2 && !log.delivered_at) {
           await this.prisma.campaign_logs.update({
             where: { id: log.id },
             data: { delivered_at: new Date() }
-          })
+          });
         }
 
         if (ack === 3 && !log.read_at) {
           await this.prisma.campaign_logs.update({
             where: { id: log.id },
             data: { read_at: new Date() }
-          })
+          });
         }
       }
-    })
+    });
 
 
 waClient.ev.on('contacts.upsert', async (contacts) => {
@@ -518,7 +551,7 @@ async _storeLidMappingFromContact(lineId, contact) {
       console.log(`🔗 LID capturado al enviar: ${lid} → ${cleanNumber}`)
     }
 
-    return { success: true }
+    return { success: true, messageId: sentMsg?.key?.id }
     } catch (error) {
       console.error('❌ Error sendMessage:', error)
       throw error
@@ -575,7 +608,7 @@ async _storeLidMappingFromContact(lineId, contact) {
       }
 
       console.log(`[HUMAN MODE] ✅ Mensaje enviado`)
-      return { success: true }
+      return { success: true, messageId: sentMsg?.key?.id }
     } catch (err) {
       console.error(`[HUMAN MODE] ❌ Error:`, err.message)
       throw err
@@ -692,25 +725,25 @@ async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
         .replace(/\{telefono\}/gi, target.phone || '')
 
       const sendOptions = { type: imageUrl ? 'image' : 'text', imageUrl }
-      let sentMsg; // Creamos la variable
+      let sendResult; // Esta variable atrapará el objeto con el messageId
       
       if (options.humanMode) {
-        sentMsg = await this.sendMessageHuman(lineaAsignada.id, target.phone, personalized, sendOptions)
+        sendResult = await this.sendMessageHuman(lineaAsignada.id, target.phone, personalized, sendOptions)
       } else {
-        // Modifica tu sendMessage para que devuelva el mensaje enviado
-        sentMsg = await this.sendMessage(lineaAsignada.id, target.phone, personalized, sendOptions)
+        sendResult = await this.sendMessage(lineaAsignada.id, target.phone, personalized, sendOptions)
       }
 
-      // ¡AQUÍ ESTÁ LA MAGIA! Guardamos el ID del mensaje
-      const exactMessageId = sentMsg?.key?.id;
+      // ¡AQUÍ ESTÁ LA MAGIA! Extraemos el ID directamente del resultado
+      const exactMessageId = sendResult?.messageId;
 
+      // 2. Guardamos el log en BD
       await this.prisma.campaign_logs.create({
         data: {
           campaign_id: campaignId,
           line_id: lineaAsignada.id,
           contact_phone: target.phone,
           status: 'sent',
-          message_id: exactMessageId // 🔥 Guardamos el ID para el futuro
+          message_id: exactMessageId // 🔥 Guardamos el ID para el cazador de Acuses
         }
       }).catch(() => {})
 
