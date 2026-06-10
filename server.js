@@ -1933,6 +1933,191 @@ app.delete('/api/blacklist/:phone', authOrSecret, loadTier, requireFeature('hasB
   }
 })
 
+
+// === AI PROMPTS ===
+
+app.get('/api/ai/prompts', authOrSecret, async (req, res) => {
+  try {
+    const where = req.user?.id ? { owner_id: req.user.id } : {}
+    const prompts = await prisma.ai_prompts.findMany({
+      where,
+      orderBy: { createdAt: 'desc' }
+    })
+    res.json({ prompts })
+  } catch (e) {
+    console.error('Error listando AI prompts:', e)
+    res.status(500).json({ error: 'Error listando prompts' })
+  }
+})
+
+app.post('/api/ai/prompts', authOrSecret, async (req, res) => {
+  try {
+    const { title, instruction, results } = req.body
+    if (!title || !instruction) {
+      return res.status(400).json({ error: 'Título e instrucción requeridos' })
+    }
+
+    const prompt = await prisma.ai_prompts.create({
+      data: {
+        title: title.trim(),
+        instruction: instruction.trim(),
+        results: results || [],
+        owner_id: req.user?.id || null
+      }
+    })
+    res.json({ success: true, prompt })
+  } catch (e) {
+    console.error('Error guardando AI prompt:', e)
+    res.status(500).json({ error: 'Error guardando prompt' })
+  }
+})
+
+app.delete('/api/ai/prompts/:id', authOrSecret, async (req, res) => {
+  try {
+    const where = { id: req.params.id }
+    if (req.user?.id) {
+      where.owner_id = req.user.id
+    }
+
+    await prisma.ai_prompts.delete({ where })
+    res.json({ success: true })
+  } catch (e) {
+    console.error('Error borrando AI prompt:', e)
+    res.status(500).json({ error: 'Error borrando prompt' })
+  }
+})
+
+
+// === OPENAI CONFIG ===
+
+app.get('/api/openai/config', authOrSecret, async (req, res) => {
+  try {
+    const config = await prisma.openai_config.findFirst({
+      where: req.user?.id ? { owner_id: req.user.id, active: true } : { active: true },
+      orderBy: { updatedAt: 'desc' }
+    })
+    if (!config) return res.json({ hasKey: false })
+    res.json({
+      hasKey: true,
+      model: config.model,
+      // Nunca devolver la key completa al frontend
+      keyPreview: `${config.api_key.slice(0, 8)}...${config.api_key.slice(-4)}`
+    })
+  } catch (e) {
+    console.error('Error leyendo config OpenAI:', e)
+    res.status(500).json({ error: 'Error leyendo configuración' })
+  }
+})
+
+app.post('/api/openai/config', authOrSecret, async (req, res) => {
+  try {
+    const { apiKey, model = 'gpt-4o-mini' } = req.body
+    if (!apiKey?.startsWith('sk-')) {
+      return res.status(400).json({ error: 'API key inválida' })
+    }
+
+    // Validar key contra OpenAI antes de guardar
+    const testRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: 'Say OK' }],
+        max_tokens: 5
+      })
+    })
+    if (!testRes.ok) throw new Error('API key inválida')
+
+    // Upsert: desactivar anteriores y crear nueva
+    if (req.user?.id) {
+      await prisma.openai_config.updateMany({
+        where: { owner_id: req.user.id },
+        data: { active: false }
+      })
+    }
+
+    const config = await prisma.openai_config.create({
+      data: {
+        owner_id: req.user?.id || null,
+        api_key: apiKey,
+        model,
+        active: true
+      }
+    })
+
+    res.json({
+      success: true,
+      model: config.model,
+      keyPreview: `${apiKey.slice(0, 8)}...${apiKey.slice(-4)}`
+    })
+  } catch (e) {
+    console.error('Error guardando config OpenAI:', e)
+    res.status(500).json({ error: e.message || 'Error verificando/guardando key' })
+  }
+})
+
+app.delete('/api/openai/config', authOrSecret, async (req, res) => {
+  try {
+    const where = req.user?.id ? { owner_id: req.user.id } : {}
+    await prisma.openai_config.updateMany({
+      where,
+      data: { active: false }
+    })
+    res.json({ success: true })
+  } catch (e) {
+    res.status(500).json({ error: 'Error eliminando config' })
+  }
+})
+
+// === AI GENERATE (proxy seguro) ===
+
+app.post('/api/ai/generate', authOrSecret, async (req, res) => {
+  try {
+    const { instruction, temperature = 0.9, maxTokens = 600 } = req.body
+    if (!instruction?.trim()) return res.status(400).json({ error: 'Instrucción requerida' })
+
+    const config = await prisma.openai_config.findFirst({
+      where: req.user?.id ? { owner_id: req.user.id, active: true } : { active: true },
+      orderBy: { updatedAt: 'desc' }
+    })
+    if (!config) return res.status(403).json({ error: 'No hay API key configurada' })
+
+    const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.api_key}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: config.model || 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content: `Sos un copywriter experto en WhatsApp marketing. Generá 5 variantes de mensajes de venta MUY CORTOS (máximo 2 líneas cada uno). Usá la variable {nombre} para personalización. Incluí emojis naturales. Tono: directo, urgente, conversacional. NO uses spintax {{a|b}}. Respondé SOLO con los 5 mensajes, uno por línea, sin numerar, sin explicaciones.`
+          },
+          { role: 'user', content: instruction }
+        ],
+        temperature,
+        max_tokens: maxTokens
+      })
+    })
+
+    const data = await openaiRes.json()
+    if (!openaiRes.ok) throw new Error(data.error?.message || 'Error de OpenAI')
+
+    const text = data.choices?.[0]?.message?.content || ''
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean)
+
+    res.json({ success: true, lines, model: config.model })
+  } catch (e) {
+    console.error('Error generando IA:', e)
+    res.status(500).json({ error: e.message || 'Error generando mensajes' })
+  }
+})
+
 // Generar código de afiliado
 app.post('/api/affiliate/generate', requireAuth, async (req, res) => {
   try {

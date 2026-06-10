@@ -248,3 +248,15 @@ model lid_mappings {
   @@index([lineId, phone])
   @@index([lid])
 }
+
+model ai_prompts {
+  id          String   @id @default(uuid())
+  title       String
+  instruction String
+  results     Json     // array de strings
+  owner_id    String?
+  owner       usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+
+  @@index([owner_id])
+}
