@@ -1246,8 +1246,26 @@ app.post('/api/campaigns/simulate', authOrSecret, async (req, res) => {
     if (!line_ids?.length) return res.status(400).json({ error: 'Seleccioná al menos una línea' })
 
     // Validación de tier
-    const license = await prisma.app_config.findUnique({ where: { key: 'license' } })
-    const tier = license?.value ? JSON.parse(license.value)?.tier : 'starter'
+    let tier = req.user?.tier || 'starter'
+    
+    if (!tier || tier === 'starter') {
+      const license = await prisma.app_config.findUnique({ where: { key: 'license' } })
+      if (license?.value) {
+        try {
+          // Intentar JSON primero
+          const parsed = JSON.parse(license.value)
+          tier = parsed?.tier || 'starter'
+        } catch {
+          // Si es JWT, decodificar payload
+          try {
+            const payload = JSON.parse(Buffer.from(license.value.split('.')[1], 'base64').toString())
+            tier = payload?.tier || 'starter'
+          } catch {
+            tier = 'starter'
+          }
+        }
+      }
+    }
     if (tier === 'starter') return res.status(403).json({ error: 'Simulacro requiere Pro o Business' })
     if (mode === 'full' && tier !== 'business') return res.status(403).json({ error: 'Simulacro Full requiere Business' })
     if (mode === 'lite' && targets.length > 1 && tier !== 'business') {
