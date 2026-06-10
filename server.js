@@ -1299,30 +1299,6 @@ app.post('/api/campaigns/simulate', authOrSecret, async (req, res) => {
   }
 })
 
-// Guardar logs del simulacro al final (para reportes)
-app.post('/api/campaigns/simulate/:id/logs', authOrSecret, async (req, res) => {
-  try {
-    const { id } = req.params
-    const { logs } = req.body
-    
-    if (!Array.isArray(logs)) return res.status(400).json({ error: 'Logs inválidos' })
-
-    const data = logs.map((log) => ({
-      campaign_id: id,
-      contact_phone: log.contact_phone,
-      status: 'ping_ok',
-      line_id: log.line_id,
-      owner_id: req.user?.id || null,
-      error: `Latencia: ${log.latency}ms`
-    }))
-
-    await prisma.campaign_logs.createMany({ data })
-    res.json({ success: true, count: logs.length })
-  } catch (e) {
-    console.error('Error guardando logs simulacro:', e)
-    res.status(500).json({ error: 'Error guardando logs' })
-  }
-})
 
 // ========== TEMPLATES ==========
 
