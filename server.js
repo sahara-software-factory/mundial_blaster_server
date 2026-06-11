@@ -1622,17 +1622,26 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       })
     }
 
-    // === RESPUESTAS GLOBALES (números que respondieron) ===
+// === RESPUESTAS GLOBALES (números que respondieron) ===
 app.get('/api/replies/global', authOrSecret, async (req, res) => {
   try {
-    const where = { has_reply: true }
-    if (req.user?.id) where.owner_id = req.user.id
+    const allReplies = await prisma.campaign_logs.findMany({
+      where: { has_reply: true },
+      select: {
+        contact_phone: true,
+        replied_at: true,
+        campaign_id: true,
+        created_at: true
+      },
+      orderBy: { replied_at: 'desc' }
+    })
 
-    const replies = await prisma.campaign_logs.findMany({
-      where,
-      select: { contact_phone: true, replied_at: true, campaign_id: true },
-      orderBy: { replied_at: 'desc' },
-      distinct: ['contact_phone']
+    // Únicos por contact_phone (el más reciente gana)
+    const seen = new Set()
+    const replies = allReplies.filter(r => {
+      if (seen.has(r.contact_phone)) return false
+      seen.add(r.contact_phone)
+      return true
     })
 
     res.json({ replies, count: replies.length })
