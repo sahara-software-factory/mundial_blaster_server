@@ -1033,15 +1033,27 @@ app.post('/api/campaigns/:id/cancel', authOrSecret, async (req, res) => {
   }
 })
 
-// Endpoint para detalle de campaña (logs individuales)
 app.get('/api/campaigns/:id/logs', authOrSecret, requireLicense, async (req, res) => {
-
   try {
     const logs = await prisma.campaign_logs.findMany({
       where: { campaign_id: req.params.id },
       orderBy: { created_at: 'desc' }
     })
-    res.json({ logs })
+
+    // Cruzar con contactos para traer nombre
+    const phones = [...new Set(logs.map(l => l.contact_phone))]
+    const contacts = await prisma.contacts.findMany({
+      where: { phone: { in: phones } },
+      select: { phone: true, name: true }
+    })
+    const nameMap = Object.fromEntries(contacts.map(c => [c.phone, c.name]))
+
+    const enriched = logs.map(l => ({
+      ...l,
+      contact_name: nameMap[l.contact_phone] || null
+    }))
+
+    res.json({ logs: enriched })
   } catch (e) {
     res.status(500).json({ error: 'Error obteniendo logs' })
   }
@@ -1622,7 +1634,6 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       })
     }
 
-// === RESPUESTAS GLOBALES (números que respondieron) ===
 app.get('/api/replies/global', authOrSecret, async (req, res) => {
   try {
     const allReplies = await prisma.campaign_logs.findMany({
@@ -1636,13 +1647,25 @@ app.get('/api/replies/global', authOrSecret, async (req, res) => {
       orderBy: { replied_at: 'desc' }
     })
 
-    // Únicos por contact_phone (el más reciente gana)
     const seen = new Set()
-    const replies = allReplies.filter(r => {
+    const uniqueReplies = allReplies.filter(r => {
       if (seen.has(r.contact_phone)) return false
       seen.add(r.contact_phone)
       return true
     })
+
+    // Cruzar con contactos
+    const phones = uniqueReplies.map(r => r.contact_phone)
+    const contacts = await prisma.contacts.findMany({
+      where: { phone: { in: phones } },
+      select: { phone: true, name: true }
+    })
+    const nameMap = Object.fromEntries(contacts.map(c => [c.phone, c.name]))
+
+    const replies = uniqueReplies.map(r => ({
+      ...r,
+      contact_name: nameMap[r.contact_phone] || null
+    }))
 
     res.json({ replies, count: replies.length })
   } catch (e) {
@@ -1650,7 +1673,6 @@ app.get('/api/replies/global', authOrSecret, async (req, res) => {
     res.status(500).json({ error: 'Error leyendo respuestas' })
   }
 })
-    
 
     // ─── PROGRAMAR PARA FECHA/HORA ───
     if (isScheduled) {
