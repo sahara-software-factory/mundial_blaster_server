@@ -1601,7 +1601,9 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
         distribution_mode: isRoundRobin ? 'round_robin' : 'single',
         line_id: lineasSeleccionadas[0]?.id || '',
         selected_lines: JSON.stringify(lineasSeleccionadas.map(l => l.id)),
-        human_mode: body.human_mode === true  
+        human_mode: body.human_mode === true,
+        proxy_node: body.proxy_node || null,
+        proxy_ip: body.proxy_ip || null
       }
     })
 
@@ -1619,6 +1621,7 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
         }
       })
     }
+    
 
     // ─── PROGRAMAR PARA FECHA/HORA ───
     if (isScheduled) {
@@ -2286,6 +2289,61 @@ app.post('/api/leads/capture', async (req, res) => {
   } catch (e) {
     console.error('❌ Lead capture error:', e)
     res.status(500).json({ error: 'Error guardando lead' })
+  }
+})
+
+
+// === PROXY HISTORY ===
+
+app.get('/api/proxy/history', authOrSecret, async (req, res) => {
+  try {
+    const where = req.user?.id ? { owner_id: req.user.id } : {}
+    const history = await prisma.proxy_history.findMany({
+      where,
+      orderBy: { usedAt: 'desc' },
+      take: 10
+    })
+    res.json({ history })
+  } catch (e) {
+    console.error('Error proxy history:', e)
+    res.status(500).json({ error: 'Error leyendo historial' })
+  }
+})
+
+app.post('/api/proxy/history', authOrSecret, async (req, res) => {
+  try {
+    const { city, country, code, fakeIp, latency } = req.body
+    if (!city || !fakeIp) return res.status(400).json({ error: 'Datos incompletos' })
+
+    const where = {
+      owner_id: req.user?.id || null,
+      city,
+      country
+    }
+
+    const existing = await prisma.proxy_history.findFirst({ where })
+    if (existing) {
+      await prisma.proxy_history.update({
+        where: { id: existing.id },
+        data: { timesUsed: { increment: 1 }, usedAt: new Date() }
+      })
+    } else {
+      await prisma.proxy_history.create({
+        data: {
+          city,
+          country,
+          code,
+          fakeIp,
+          latency,
+          owner_id: req.user?.id || null
+        }
+      })
+    }
+
+    res.json({ success: true })
+  } catch (e) {
+    console.error('Error guardando proxy:', e)
+    res.status(500).json({ error: 'Error guardando proxy' })
   }
 })
 

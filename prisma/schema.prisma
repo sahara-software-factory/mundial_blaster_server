@@ -48,6 +48,7 @@ model usuarios {
   blacklists   blacklist[]
   openai       openai_config[]
   ai_prompts   ai_prompts[]
+  proxy_history proxy_history[]
 }
 
 model leads {
@@ -97,6 +98,8 @@ model campaigns {
   finished_at       DateTime?
   human_mode        Boolean  @default(false)
   distribution_mode String   @default("single")
+  proxy_node    String?
+  proxy_ip      String?
   selected_lines    String?
   
   owner_id          String?
@@ -261,4 +264,21 @@ model ai_prompts {
   createdAt   DateTime @default(now())
 
   @@index([owner_id])
+}
+
+model proxy_history {
+  id          String   @id @default(uuid())
+  city        String
+  country     String
+  code        String
+  fakeIp      String
+  latency     Int
+  usedAt      DateTime @default(now())
+  timesUsed   Int      @default(1)
+  
+  owner_id    String?
+  owner       usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
+
+  @@index([owner_id])
+  @@index([usedAt])
 }
