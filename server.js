@@ -1621,6 +1621,26 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
         }
       })
     }
+
+    // === RESPUESTAS GLOBALES (números que respondieron) ===
+app.get('/api/replies/global', authOrSecret, async (req, res) => {
+  try {
+    const where = { has_reply: true }
+    if (req.user?.id) where.owner_id = req.user.id
+
+    const replies = await prisma.campaign_logs.findMany({
+      where,
+      select: { contact_phone: true, replied_at: true, campaign_id: true },
+      orderBy: { replied_at: 'desc' },
+      distinct: ['contact_phone']
+    })
+
+    res.json({ replies, count: replies.length })
+  } catch (e) {
+    console.error('Error global replies:', e)
+    res.status(500).json({ error: 'Error leyendo respuestas' })
+  }
+})
     
 
     // ─── PROGRAMAR PARA FECHA/HORA ───
