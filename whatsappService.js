@@ -189,7 +189,7 @@ class WAService {
             where: { id: lineId },
             data: { status: 'DESCONECTADA' }
           }).catch(() => {})
-          this.io.emit('status', { lineId, status: 'DESCONECTADA', reason: 'SESSION_INVALID', phone:line_phone, nombre: line_nombre })
+          this.io.emit('status', { lineId, status: 'DESCONECTADA', reason: 'SESSION_INVALID', phone: phone })
           return
         }
 
