@@ -747,6 +747,16 @@ async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
         }
       }).catch(() => {})
 
+
+            // ✅ Incrementar sent en DB
+      await this.prisma.campaigns.update({
+        where: { id: campaignId },
+        data: { sent: { increment: 1 } }
+      }).catch(e => console.error(`[DB] Error incrementando sent:`, e.message))
+
+      // ✅ Guardar en results para el resumen final
+      results.push({ phone: target.phone, status: 'sent', lineId: lineaAsignada.id, index: i })
+
       this.io.emit('campaign_log', {
         campaignId: campaignId,           // camelCase (dashboard en vivo)
         campaign_id: campaignId,          // snake_case (reports/page.tsx)
@@ -837,6 +847,8 @@ async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
     total_sent: results.filter(r => r.status === 'sent').length,
     total_failed: results.filter(r => r.status === 'failed').length
   })
+
+  console.log(`[CAMPAIGN] ${campaignId} finalizada. Results:`, results.length, 'sent:', results.filter(r => r.status === 'sent').length, 'failed:', results.filter(r => r.status === 'failed').length)
 
   return results
 }
