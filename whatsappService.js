@@ -744,7 +744,7 @@ async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
         data: {
           campaign_id: campaignId,
           line_id: null,
-          contact_phone: target.phone,
+           contact_phone: target.phone,
           status: 'failed',
           error: 'Todas las líneas offline'
         }
