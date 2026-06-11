@@ -701,8 +701,44 @@ async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
       intentos++
     }
 
-    if (!lineaAsignada) {
-      // Todas las líneas cayeron
+        if (!lineaAsignada) {
+      // ¿Quedan ALGUNAS líneas vivas en todo el pool?
+      const quedanLineasGlobales = lineasActivas.some(l => !lineasCaidas.has(l.id))
+      
+      if (!quedanLineasGlobales) {
+        // 🔴 TODAS LAS LÍNEAS CAÍDAS — DETENER EN SECO
+        console.log(`🛑 TODAS LAS LÍNEAS CAÍDAS. Deteniendo campaña ${campaignId} en ${i}/${targets.length}`)
+        
+        await this.prisma.campaign_logs.create({
+          data: {
+            campaign_id: campaignId,
+            line_id: null,
+            contact_phone: target.phone,
+            status: 'failed',
+            error: 'Todas las líneas offline - Campaña detenida por desconexión total'
+          }
+        }).catch(() => {})
+
+        this.io.emit('campaign_log', {
+          campaignId: campaignId,
+          campaign_id: campaignId,
+          phone: target.phone,
+          contact_phone: target.phone,
+          status: 'failed',
+          lineId: null,
+          line_id: null,
+          linePhone: null,
+          line_phone: null,
+          error: 'TODAS LAS LÍNEAS CAÍDAS - CAMPAÑA DETENIDA',
+          progress: `${i + 1}/${targets.length}`,
+          isEmergencyStop: true
+        })
+
+        wasCancelled = true
+        break // ← DETENER EL LOOP AHORA
+      }
+
+      // Fallback: no hay línea para este contacto pero otras existen (raro)
       results.push({ phone: target.phone, status: 'failed', error: 'Todas las líneas offline', index: i })
       await this.prisma.campaign_logs.create({
         data: {
@@ -811,14 +847,46 @@ async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
         }
       }).catch(() => {})
 
-      // Si hay otras líneas vivas, reintentar este mismo contacto (i-- para no avanzar)
+            // Si hay otras líneas vivas, reintentar este mismo contacto
       const quedanLineas = lineasActivas.some(l => !lineasCaidas.has(l.id))
       if (quedanLineas) {
         i-- // repetir este contacto con la siguiente línea disponible
       } else {
+        // 🔴 TODAS LAS LÍNEAS CAÍDAS — DETENER EN SECO
+        console.log(`🛑 TODAS LAS LÍNEAS CAÍDAS (catch). Deteniendo campaña ${campaignId}`)
+        
         results.push({ phone: target.phone, status: 'failed', error: err.message, index: i })
+
+        await this.prisma.campaign_logs.create({
+          data: {
+            campaign_id: campaignId,
+            line_id: lineaAsignada.id,
+            contact_phone: target.phone,
+            status: 'failed',
+            error: 'Todas las líneas caídas - Campaña detenida'
+          }
+        }).catch(() => {})
+
+        this.io.emit('campaign_log', {
+          campaignId: campaignId,
+          campaign_id: campaignId,
+          phone: target.phone,
+          contact_phone: target.phone,
+          status: 'failed',
+          lineId: lineaAsignada.id,
+          line_id: lineaAsignada.id,
+          linePhone: lineaAsignada.phone,
+          line_phone: lineaAsignada.phone,
+          error: 'TODAS LAS LÍNEAS CAÍDAS - CAMPAÑA DETENIDA',
+          progress: `${i + 1}/${targets.length}`,
+          isEmergencyStop: true
+        })
+
+        wasCancelled = true
+        break // ← DETENER EL LOOP AHORA
       }
     }
+  
 
     // Delay anti-ban (solo si no es el último)
         // Delay anti-ban (solo si no es el último)
