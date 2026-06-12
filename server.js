@@ -2080,10 +2080,25 @@ app.post('/api/blacklist', authOrSecret, loadTier, requireFeature('hasBlacklist'
 
 app.delete('/api/blacklist/:phone', authOrSecret, loadTier, requireFeature('hasBlacklist'), async (req, res) => {
   try {
-    await prisma.blacklist.delete({ where: { phone: req.params.phone.replace(/\D/g, '') } })
-    res.json({ success: true })
+    const cleanPhone = req.params.phone.replace(/\D/g, '')
+    
+    // Buscar por phone (sin importar owner_id)
+    const entry = await prisma.blacklist.findFirst({
+      where: { phone: cleanPhone }
+    })
+
+    if (!entry) {
+      return res.status(404).json({ error: 'Número no encontrado en blacklist' })
+    }
+
+    await prisma.blacklist.delete({
+      where: { id: entry.id }
+    })
+
+    res.json({ success: true, phone: cleanPhone })
   } catch (e) {
-    res.status(500).json({ error: 'Error eliminando de blacklist' })
+    console.error('Blacklist delete error:', e)
+    res.status(500).json({ error: 'Error eliminando de blacklist', detail: e.message })
   }
 })
 
