@@ -107,6 +107,7 @@ model campaigns {
   proxy_node    String?
   proxy_ip      String?
   selected_lines    String?
+  summary    String? 
   
   owner_id          String?
   owner             usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)

@@ -2323,7 +2323,7 @@ app.post('/api/ai/generate', authOrSecret, async (req, res) => {
 REGLAS OBLIGATORIAS:
 1. Cada mensaje debe tener ENTRE 80 y 180 palabras (no menos, no más).
 2. Usá SPINTAX real con la sintaxis {{opción1|opción2|opción3}} en múltiples partes del texto.
-3. Incluí la variable {nombre} al inicio para personalización.
+3. No incluyas la variable {nombre}.
 4. Estructura obligatoria por mensaje:
    - Hook de atención (emoji + spintax)
    - Identificación del problema o dolor
@@ -2333,7 +2333,19 @@ REGLAS OBLIGATORIAS:
 5. Tono: directo, urgente, conversacional pero profesional. Argentino/Chileno/Mexicano según el contexto.
 6. Usá emojis estratégicos (máximo 6 por mensaje).
 7. NO expliques nada. Respondé SOLO los 5 mensajes, separados por ---
-8. Cada mensaje debe ser único y distinto a los otros 4.`
+8. Cada mensaje debe ser único y distinto a los otros 4.
+9. Si la persona te pide que te explayes o amplies y hagas un texto largo convincente, el ejemplo aprox que tenes que tomar es el siguiente:
+COPY EJEMPLO CON SALTOS DE LINEA Y ORDENADO SEGUN URGENCIA.
+🚀ATENCION CLIENTES NUEVO Curso DESARROLLO WEB BLACK ADS ¿Tenes un casin online o una plataforma y no podes generar ventas con tu LANDING PAGE? Empezá hoy nuestro curso exclusivo! No dependas mas de nadie ! Para vos, para tu equipo de marketing o encargados, es un curso que no podes dejar pasar ✅ Dejala lista para Google Ads tambien!
+
+✅ Aprende sobre crear landing con IA en segundos, ediciones, hosting, vps, pixeles, eventos, filtros antibots para evitar duplicacion de eventos, redirecciones, entre mucho mas! +12 horas de pura enseñanza repartidas entre +40 clases grabadas en nuestra aula virtual 🧠 que te llevarán de 0 a 100 en conversiones
+
+🫸 Dejá de usar plantillas genéricas. Aprende a crear landing page que convierten con IA y Bootstap🤖 para crear páginas que el algoritmo ama y que tus clientes no pueden ignorar. 
+
+🌐 Ingresa a nuestra web para ver el programa y los paquetes que tenemos: www.web.com
+
+Basate siempre en el negocio y/o indicaciones del cliente, no en el texto de ejemplo, no olvides de usar spintax para todo.
+`
           },
           { role: 'user', content: instruction }
         ],
@@ -2471,10 +2483,44 @@ app.post('/api/ai/title', authOrSecret, async (req, res) => {
   }
 })
 
+app.get('/api/ai/estimate', authOrSecret, async (req, res) => {
+  try {
+    // Contar prompts generados este mes
+    const startOfMonth = new Date()
+    startOfMonth.setDate(1)
+    startOfMonth.setHours(0, 0, 0, 0)
+
+    const count = await prisma.ai_prompts.count({
+      where: {
+        owner_id: req.user?.id,
+        createdAt: { gte: startOfMonth }
+      }
+    })
+
+    // Promedio: cada generación ~1000 tokens (prompt + respuesta)
+    // gpt-4o-mini: $0.60 input / $2.40 output por 1M tokens
+    // Asumimos 70% input, 30% output
+    const tokensPerGen = 1000
+    const totalTokens = count * tokensPerGen
+    const costPer1M = 0.60 * 0.7 + 2.40 * 0.3 // ~$1.14 por 1M tokens promedio
+    const estimatedCost = (totalTokens / 1000000) * costPer1M
+
+    res.json({
+      generationsThisMonth: count,
+      estimatedTokens: totalTokens,
+      estimatedCost: Math.round(estimatedCost * 100) / 100, // 2 decimales
+      currency: 'USD'
+    })
+  } catch (e) {
+    res.status(500).json({ error: 'Error calculando estimado' })
+  }
+})
 
 app.post('/api/ai/summary', authOrSecret, async (req, res) => {
   try {
     const { campaignId, sent, failed, total } = req.body
+    if (!campaignId) return res.status(400).json({ error: 'campaignId requerido' })
+
     const config = await prisma.openai_config.findFirst({
       where: req.user?.id ? { owner_id: req.user.id, active: true } : { active: true },
       orderBy: { updatedAt: 'desc' }
@@ -2501,10 +2547,23 @@ app.post('/api/ai/summary', authOrSecret, async (req, res) => {
       })
     })
 
+    if (!openaiRes.ok) {
+      const err = await openaiRes.json()
+      throw new Error(err.error?.message || 'Error OpenAI')
+    }
+
     const data = await openaiRes.json()
     const summary = data.choices?.[0]?.message?.content?.trim() || 'Campaña finalizada.'
+
+    // Guardar en DB (silencioso si falla)
+    await prisma.campaigns.update({
+      where: { id: campaignId },
+      data: { summary }
+    }).catch(() => {})
+
     res.json({ summary })
   } catch (e) {
+    console.error('Summary error:', e)
     res.status(500).json({ error: 'Error generando resumen' })
   }
 })
