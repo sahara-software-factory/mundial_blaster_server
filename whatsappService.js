@@ -955,6 +955,12 @@ async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
     data: { status: finalStatus, finished_at: new Date() }
   }).catch(() => {})
 
+  console.log('🔥 EMITIENDO campaign_complete:', {
+  campaignId,
+  sent: results.filter(r => r.status === 'sent').length,
+  failed: results.filter(r => r.status === 'failed').length
+})
+
   this.io.emit('campaign_complete', {
     campaignId: campaignId,
     campaign_id: campaignId,

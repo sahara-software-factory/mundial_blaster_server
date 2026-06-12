@@ -2517,15 +2517,22 @@ app.get('/api/ai/estimate', authOrSecret, async (req, res) => {
 })
 
 app.post('/api/ai/summary', authOrSecret, async (req, res) => {
+  console.log('🎯 ENTRÓ a /api/ai/summary', req.body)
   try {
     const { campaignId, sent, failed, total } = req.body
-    if (!campaignId) return res.status(400).json({ error: 'campaignId requerido' })
+    if (!campaignId) {
+      console.log('❌ Falta campaignId')
+      return res.status(400).json({ error: 'campaignId requerido' })
+    }
 
     const config = await prisma.openai_config.findFirst({
       where: req.user?.id ? { owner_id: req.user.id, active: true } : { active: true },
       orderBy: { updatedAt: 'desc' }
     })
-    if (!config) return res.status(403).json({ error: 'No hay API key' })
+    if (!config) {
+      console.log('❌ No hay API key configurada')
+      return res.status(403).json({ error: 'No hay API key' })
+    }
 
     const deliveryRate = total > 0 ? Math.round((sent / total) * 100) : 0
     const prompt = `Campaña finalizada: ${sent} enviados, ${failed} fallidos, ${deliveryRate}% tasa de entrega. Generá un resumen ejecutivo de 2 oraciones con recomendación práctica para la próxima campaña. Tono: directo, profesional.`
@@ -2549,17 +2556,19 @@ app.post('/api/ai/summary', authOrSecret, async (req, res) => {
 
     if (!openaiRes.ok) {
       const err = await openaiRes.json()
+      console.error('❌ OpenAI error:', err)
       throw new Error(err.error?.message || 'Error OpenAI')
     }
 
     const data = await openaiRes.json()
     const summary = data.choices?.[0]?.message?.content?.trim() || 'Campaña finalizada.'
+    console.log('✅ Resumen generado:', summary)
 
-    // Guardar en DB (silencioso si falla)
+    // Guardar en DB
     await prisma.campaigns.update({
       where: { id: campaignId },
       data: { summary }
-    }).catch(() => {})
+    }).catch((e) => console.error('❌ Error guardando summary en DB:', e))
 
     res.json({ summary })
   } catch (e) {
