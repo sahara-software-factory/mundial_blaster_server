@@ -1463,15 +1463,31 @@ app.post('/api/templates/:id/use', authOrSecret, async (req, res) => {
 })
 
 // Categorías únicas
-app.get('/api/templates/categories', authOrSecret, async (req, res) => {
+app.get('/api/templates', authOrSecret, async (req, res) => {
   try {
+    const { search, category, favorite } = req.query
+    const where = {}
+    
+    if (req.user?.id) where.owner_id = req.user.id
+    
+    if (search) {
+      where.OR = [
+        { name: { contains: search, mode: 'insensitive' } },
+        { content: { contains: search, mode: 'insensitive' } }
+      ]
+    }
+    
+    if (category) where.category = category
+    if (favorite === 'true') where.isFavorite = true
+    
     const templates = await prisma.message_templates.findMany({
-      select: { category: true },
-      distinct: ['category']
+      where,
+      orderBy: { createdAt: 'desc' }
     })
-    res.json({ categories: templates.map(t => t.category) })
+    
+    res.json({ templates })
   } catch (e) {
-    res.status(500).json({ error: 'Error' })
+    res.status(500).json({ error: 'Error listando templates' })
   }
 })
 
