@@ -1360,7 +1360,7 @@ app.get('/api/templates', authOrSecret, async (req, res) => {
 })
 
 app.post('/api/templates', authOrSecret, loadTier, async (req, res) => {
-  const { name, content, category } = req.body
+  const { name, content, category, imageUrl } = req.body
   if (!name || !content) return res.status(400).json({ error: 'Nombre y contenido requeridos' })
 
   const currentTemplates = await prisma.message_templates.count()
@@ -1373,7 +1373,6 @@ app.post('/api/templates', authOrSecret, loadTier, async (req, res) => {
     })
   }
   
-  // Extraer variables automáticamente: {{variable}}
   const variables = [...content.matchAll(/\{\{(\w+)\}\}/g)].map(m => m[1])
   const uniqueVars = [...new Set(variables)]
   
@@ -1383,7 +1382,8 @@ app.post('/api/templates', authOrSecret, loadTier, async (req, res) => {
         name,
         content,
         category: category || 'General',
-        variables: uniqueVars
+        variables: uniqueVars,
+        imageUrl: imageUrl || null  // ← AGREGADO
       }
     })
     res.json({ success: true, template })
@@ -1394,17 +1394,18 @@ app.post('/api/templates', authOrSecret, loadTier, async (req, res) => {
 
 app.patch('/api/templates/:id', authOrSecret, async (req, res) => {
   const { id } = req.params
-  const { name, content, category } = req.body
+  const { name, content, category, imageUrl } = req.body
   
   const variables = content ? [...content.matchAll(/\{\{(\w+)\}\}/g)].map(m => m[1]) : undefined
   const uniqueVars = variables ? [...new Set(variables)] : undefined
   
   try {
     const updateData = {}
-    if (name) updateData.name = name
-    if (content) updateData.content = content
-    if (category) updateData.category = category
-    if (uniqueVars) updateData.variables = uniqueVars
+    if (name !== undefined) updateData.name = name
+    if (content !== undefined) updateData.content = content
+    if (category !== undefined) updateData.category = category
+    if (uniqueVars !== undefined) updateData.variables = uniqueVars
+    if (imageUrl !== undefined) updateData.imageUrl = imageUrl || null  // ← AGREGADO
     
     const template = await prisma.message_templates.update({
       where: { id },

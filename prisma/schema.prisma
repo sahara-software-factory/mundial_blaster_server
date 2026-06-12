@@ -204,7 +204,7 @@ model message_templates {
   variables  String[] @default([])
   usageCount Int      @default(0)
   createdAt  DateTime @default(now())
-
+  imageUrl   String?
   owner_id   String?
   owner      usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
 
