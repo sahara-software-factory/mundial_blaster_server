@@ -31,6 +31,12 @@ model usuarios {
   expected_volume      String?
   onboarding_completed Boolean  @default(false)
 
+   // IA Features (nuevas)
+  ai_audit_enabled     Boolean  @default(false)
+  ai_title_enabled     Boolean  @default(false)
+  ai_summary_enabled   Boolean  @default(false)
+  ai_translate_enabled Boolean  @default(false)
+
   // Recuperación
   reset_token          String?
   reset_token_expires  DateTime?
