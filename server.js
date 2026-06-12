@@ -2298,7 +2298,7 @@ app.delete('/api/openai/config', authOrSecret, async (req, res) => {
 
 app.post('/api/ai/generate', authOrSecret, async (req, res) => {
   try {
-    const { instruction, temperature = 0.9, maxTokens = 600 } = req.body
+    const { instruction, temperature = 0.85, maxTokens = 1200 } = req.body
     if (!instruction?.trim()) return res.status(400).json({ error: 'Instrucción requerida' })
 
     const config = await prisma.openai_config.findFirst({
@@ -2314,11 +2314,26 @@ app.post('/api/ai/generate', authOrSecret, async (req, res) => {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: config.model || 'gpt-4o-mini',
+        model: config.model || 'gpt-4o',
         messages: [
           {
             role: 'system',
-            content: `Sos un copywriter experto en WhatsApp marketing. Generá 5 variantes de mensajes de venta MUY CORTOS (máximo 2 líneas cada uno). Usá la variable {nombre} para personalización. Incluí emojis naturales. Tono: directo, urgente, conversacional. NO uses spintax {{a|b}}. Respondé SOLO con los 5 mensajes, uno por línea, sin numerar, sin explicaciones.`
+            content: `Sos un copywriter senior especializado en marketing por WhatsApp para Latinoamérica. Generá 5 variantes de mensajes de venta PROFESIONALES y CONVINCENTES.
+
+REGLAS OBLIGATORIAS:
+1. Cada mensaje debe tener ENTRE 80 y 180 palabras (no menos, no más).
+2. Usá SPINTAX real con la sintaxis {{opción1|opción2|opción3}} en múltiples partes del texto.
+3. Incluí la variable {nombre} al inicio para personalización.
+4. Estructura obligatoria por mensaje:
+   - Hook de atención (emoji + spintax)
+   - Identificación del problema o dolor
+   - Solución/Oferta con beneficio claro
+   - CTA (call to action) fuerte
+   - Escasez o urgencia
+5. Tono: directo, urgente, conversacional pero profesional. Argentino/Chileno/Mexicano según el contexto.
+6. Usá emojis estratégicos (máximo 6 por mensaje).
+7. NO expliques nada. Respondé SOLO los 5 mensajes, separados por ---
+8. Cada mensaje debe ser único y distinto a los otros 4.`
           },
           { role: 'user', content: instruction }
         ],
@@ -2331,15 +2346,209 @@ app.post('/api/ai/generate', authOrSecret, async (req, res) => {
     if (!openaiRes.ok) throw new Error(data.error?.message || 'Error de OpenAI')
 
     const text = data.choices?.[0]?.message?.content || ''
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean)
+    // Separar por --- o saltos de línea dobles
+    const lines = text.split(/---|\n\n+/).map(l => l.trim()).filter(Boolean)
 
-    res.json({ success: true, lines, model: config.model })
+    res.json({ success: true, lines, model: config.model, tokens: data.usage?.total_tokens })
   } catch (e) {
     console.error('Error generando IA:', e)
     res.status(500).json({ error: e.message || 'Error generando mensajes' })
   }
 })
 
+
+app.post('/api/ai/audit', authOrSecret, async (req, res) => {
+  try {
+    const { message } = req.body
+    if (!message) return res.status(400).json({ error: 'Mensaje requerido' })
+
+    const checks = []
+    let score = 100
+
+    // Check 1: Mayúsculas
+    const upperRatio = (message.match(/[A-Z]/g) || []).length / message.length
+    if (upperRatio > 0.3) {
+      checks.push({ ok: false, label: 'Demasiadas mayúsculas (' + Math.round(upperRatio * 100) + '%). Reducí a 15%.' })
+      score -= 20
+    } else {
+      checks.push({ ok: true, label: 'Uso de mayúsculas correcto' })
+    }
+
+    // Check 2: Link en primer mensaje
+    if (/https?:\/\//.test(message) && message.indexOf('http') < 50) {
+      checks.push({ ok: false, label: 'Link en las primeras líneas = 80% riesgo de ban. Mover al final.' })
+      score -= 25
+    } else if (/https?:\/\//.test(message)) {
+      checks.push({ ok: true, label: 'Link presente pero no en el hook' })
+    } else {
+      checks.push({ ok: true, label: 'Sin links (más seguro)' })
+    }
+
+    // Check 3: Spintax
+    if (!/\{\{[^}]+\}\}/.test(message)) {
+      checks.push({ ok: false, label: 'Sin spintax detectado. Agregá {{opción1|opción2}} para variar mensajes.' })
+      score -= 15
+    } else {
+      checks.push({ ok: true, label: 'Spintax detectado ✅' })
+    }
+
+    // Check 4: Variables
+    if (!/\{nombre\}/.test(message)) {
+      checks.push({ ok: false, label: 'Sin variable {nombre}. Personalizá para mejor entrega.' })
+      score -= 10
+    } else {
+      checks.push({ ok: true, label: 'Variable {nombre} presente ✅' })
+    }
+
+    // Check 5: Longitud
+    const wordCount = message.split(/\s+/).length
+    if (wordCount < 20) {
+      checks.push({ ok: false, label: 'Mensaje muy corto (' + wordCount + ' palabras). Mínimo 30 para no parecer spam.' })
+      score -= 10
+    } else if (wordCount > 200) {
+      checks.push({ ok: false, label: 'Mensaje muy largo (' + wordCount + ' palabras). WhatsApp corta en 4096 chars.' })
+      score -= 5
+    } else {
+      checks.push({ ok: true, label: 'Longitud óptima (' + wordCount + ' palabras)' })
+    }
+
+    // Check 6: Emojis
+    const emojiCount = (message.match(/[\u{1F300}-\u{1F9FF}]/gu) || []).length
+    if (emojiCount > 8) {
+      checks.push({ ok: false, label: 'Demasiados emojis (' + emojiCount + '). Máximo 6 recomendado.' })
+      score -= 10
+    } else {
+      checks.push({ ok: true, label: 'Emojis balanceados (' + emojiCount + ')' })
+    }
+
+    let suggestion = null
+    if (score < 50) suggestion = 'Riesgo ALTO de ban. Revisá mayúsculas, links y agregá spintax.'
+    else if (score < 80) suggestion = 'Riesgo MODERADO. Mejorá spintax y mové el link al final.'
+    else suggestion = 'Mensaje optimizado. Buena probabilidad de entrega.'
+
+    res.json({ score: Math.max(0, score), checks, suggestion })
+  } catch (e) {
+    res.status(500).json({ error: 'Error auditando' })
+  }
+})
+
+app.post('/api/ai/title', authOrSecret, async (req, res) => {
+  try {
+    const { message } = req.body
+    if (!message) return res.status(400).json({ error: 'Mensaje requerido' })
+
+    const config = await prisma.openai_config.findFirst({
+      where: req.user?.id ? { owner_id: req.user.id, active: true } : { active: true },
+      orderBy: { updatedAt: 'desc' }
+    })
+    if (!config) return res.status(403).json({ error: 'No hay API key' })
+
+    const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.api_key}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content: 'Generá un título corto y atractivo para una campaña de WhatsApp. Máximo 40 caracteres. Incluí un emoji al inicio. Respondé SOLO el título, sin comillas, sin explicaciones.'
+          },
+          { role: 'user', content: message.slice(0, 300) }
+        ],
+        temperature: 0.7,
+        max_tokens: 60
+      })
+    })
+
+    const data = await openaiRes.json()
+    const title = data.choices?.[0]?.message?.content?.trim() || 'Campaña sin nombre'
+    res.json({ title })
+  } catch (e) {
+    res.status(500).json({ error: 'Error generando título' })
+  }
+})
+
+
+app.post('/api/ai/summary', authOrSecret, async (req, res) => {
+  try {
+    const { campaignId, sent, failed, total } = req.body
+    const config = await prisma.openai_config.findFirst({
+      where: req.user?.id ? { owner_id: req.user.id, active: true } : { active: true },
+      orderBy: { updatedAt: 'desc' }
+    })
+    if (!config) return res.status(403).json({ error: 'No hay API key' })
+
+    const deliveryRate = total > 0 ? Math.round((sent / total) * 100) : 0
+    const prompt = `Campaña finalizada: ${sent} enviados, ${failed} fallidos, ${deliveryRate}% tasa de entrega. Generá un resumen ejecutivo de 2 oraciones con recomendación práctica para la próxima campaña. Tono: directo, profesional.`
+
+    const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.api_key}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Sos un analista de marketing. Resumí campañas en 2 oraciones con recomendación práctica.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.7,
+        max_tokens: 150
+      })
+    })
+
+    const data = await openaiRes.json()
+    const summary = data.choices?.[0]?.message?.content?.trim() || 'Campaña finalizada.'
+    res.json({ summary })
+  } catch (e) {
+    res.status(500).json({ error: 'Error generando resumen' })
+  }
+})
+
+// GET /api/me/ai-features — traer estado actual
+app.get('/api/me/ai-features', authOrSecret, async (req, res) => {
+  try {
+    const user = await prisma.usuarios.findUnique({
+      where: { id: req.user.id },
+      select: {
+        ai_audit_enabled: true,
+        ai_title_enabled: true,
+        ai_summary_enabled: true,
+        ai_translate_enabled: true
+      }
+    })
+    res.json({ features: user })
+  } catch (e) {
+    res.status(500).json({ error: 'Error leyendo features' })
+  }
+})
+
+// PATCH /api/me/ai-features — toggle
+app.patch('/api/me/ai-features', authOrSecret, async (req, res) => {
+  try {
+    const { feature, enabled } = req.body
+    const validFeatures = ['ai_audit_enabled', 'ai_title_enabled', 'ai_summary_enabled', 'ai_translate_enabled']
+    if (!validFeatures.includes(feature)) {
+      return res.status(400).json({ error: 'Feature inválida' })
+    }
+
+    const data = {}
+    data[feature] = enabled
+
+    await prisma.usuarios.update({
+      where: { id: req.user.id },
+      data
+    })
+
+    res.json({ success: true, feature, enabled })
+  } catch (e) {
+    res.status(500).json({ error: 'Error actualizando feature' })
+  }
+})
 // Generar código de afiliado
 app.post('/api/affiliate/generate', requireAuth, async (req, res) => {
   try {
