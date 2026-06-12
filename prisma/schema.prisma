@@ -205,6 +205,7 @@ model message_templates {
   usageCount Int      @default(0)
   createdAt  DateTime @default(now())
   imageUrl   String?
+  isFavorite Boolean  @default(false)
   owner_id   String?
   owner      usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
 

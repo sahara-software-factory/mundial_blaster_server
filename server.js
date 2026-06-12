@@ -1475,6 +1475,30 @@ app.get('/api/templates/categories', authOrSecret, async (req, res) => {
   }
 })
 
+app.patch('/api/templates/:id/favorite', authOrSecret, async (req, res) => {
+  try {
+    const { id } = req.params
+    const template = await prisma.message_templates.findUnique({
+      where: { id },
+      select: { isFavorite: true }
+    })
+    
+    if (!template) {
+      return res.status(404).json({ error: 'Template no encontrado' })
+    }
+
+    const updated = await prisma.message_templates.update({
+      where: { id },
+      data: { isFavorite: !template.isFavorite }
+    })
+
+    res.json({ success: true, isFavorite: updated.isFavorite })
+  } catch (e) {
+    console.error('Error toggle favorite:', e)
+    res.status(500).json({ error: 'Error actualizando favorito' })
+  }
+})
+
 // ========== LÍNEAS ==========
 app.post('/api/lineas/connect', authOrSecret, requireLicense, async (req, res) => {
   const { phone } = req.body
