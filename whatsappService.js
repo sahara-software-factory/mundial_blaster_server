@@ -234,20 +234,19 @@ class WAService {
   waClient.ev.on('messages.upsert', async ({ messages, type }) => {
   if (type !== 'notify') return
   for (const msg of messages) {
-    if (!msg.message || msg.key.fromMe) continue
+    if (!msg.message) continue
 
     const messageBody = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
     
     // ==========================================
-    // 🧠 EL RESCATE DEL NÚMERO REAL (Patrón Sahara One)
+    // 🔧 EXTRACCIÓN DEL NÚMERO (entrante o saliente)
     // ==========================================
     const raw = msg.key.remoteJid;
-    const alt = msg.key.remoteJidAlt; // 🔑 LA MAGIA — WhatsApp manda ambos en el mismo paquete
+    const alt = msg.key.remoteJidAlt;
     
     let fromPhone = null;
     let lidDetectado = null;
 
-    // Paso 1: Leer ambos campos del mensaje a la vez
     if (raw?.includes('@s.whatsapp.net')) {
         fromPhone = raw.split('@')[0].replace(/\D/g, '');
     } else if (raw?.includes('@lid')) {
@@ -260,7 +259,6 @@ class WAService {
         lidDetectado = alt.split('@')[0];
     }
 
-    // Paso 2: AUTO-SANACIÓN — Si el mensaje trajo ambos, curar la BD en el momento
     if (fromPhone && lidDetectado) {
       this.lidCache.set(`${lineId}:${lidDetectado}`, fromPhone);
       await this.prisma.lid_mappings.upsert({
@@ -268,49 +266,92 @@ class WAService {
         update: { phone: fromPhone, updatedAt: new Date() },
         create: { lineId, lid: lidDetectado, phone: fromPhone }
       }).catch(() => {});
-      console.log(`🩺 Auto-sanación instantánea: ${lidDetectado} → ${fromPhone}`);
     }
 
-    // Paso 3: Si solo tenemos LID (remoteJidAlt no vino), buscar en caché/BD
     if (!fromPhone && lidDetectado) {
       fromPhone = await this.resolvePhoneFromJid(lineId, `${lidDetectado}@lid`);
     }
 
-    // Paso 4: ÚLTIMO RECURSO — Usar el LID limpio como ID temporal
-    // El mensaje NO se descarta. Cuando llegue otro mensaje con remoteJidAlt, o enviemos uno, se reconcilia solo.
     if (!fromPhone && lidDetectado) {
       fromPhone = lidDetectado;
-      console.log(`⚠️ LID sin resolver aún, usando como ID temporal: ${lidDetectado}`);
     }
 
-    // 🛑 FILTRO FINAL: Si no tenemos absolutamente nada, abortar.
     if (!fromPhone) {
-      console.log(`⚠️ JID irresoluble (incluso sin LID temporal): ${raw}`);
+      console.log(`⚠️ JID irresoluble: ${raw}`);
       continue;
     }
 
-    // Actualizar caché preventivamente (si fromPhone vino del Paso 3)
     if (lidDetectado && fromPhone && fromPhone !== lidDetectado) {
       this.lidCache.set(`${lineId}:${lidDetectado}`, fromPhone);
     }
 
+    // ==========================================
+    // 🛡️ MENSAJES SALIENTES: Comandos de operador
+    // ==========================================
+    if (msg.key.fromMe) {
+      const cmd = messageBody.trim().toLowerCase()
+      let reason = null
+
+      if (cmd === '!blacklist' || cmd.startsWith('!blacklist ')) {
+        reason = cmd.replace('!blacklist', '').trim() || 'manual desde chat'
+      } else if (cmd === '!falso') {
+        reason = 'comprobante falso'
+      } else if (cmd === '!spam') {
+        reason = 'spam'
+      } else if (cmd === '!ban') {
+        reason = 'ban manual'
+      } else if (cmd === '!estafa') {
+        reason = 'estafa'
+      } else if (cmd === '!no') {
+        reason = 'rechazado por operador'
+      }
+
+      if (reason && fromPhone) {
+        try {
+          const cleanPhone = fromPhone.replace(/\D/g, '')
+          const entry = await this.prisma.blacklist.upsert({
+            where: { phone: cleanPhone },
+            update: { reason },
+            create: { phone: cleanPhone, reason, owner_id: null }
+          })
+          console.log(`🛡️ Operador marcó blacklist: ${cleanPhone} → ${reason}`)
+          this.io.emit('operator_blacklist', { 
+            phone: cleanPhone, 
+            reason, 
+            timestamp: new Date(),
+            entry 
+          })
+          // Opcional: enviar confirmación al operador vía WhatsApp
+          // await this.sendMessage(lineId, cleanPhone, `✅ Número marcado en blacklist: ${reason}`)
+        } catch (e) {
+          console.error('Operator blacklist error:', e)
+        }
+      }
+      continue // No procesar más para mensajes salientes
+    }
+
+    // ==========================================
+    // 📥 MENSAJES ENTRANTES: Auto-blacklist + Reply tracking
+    // ==========================================
+    
     // ─── AUTO BLACKLIST ───
     try {
       const config = await this.prisma.app_config.findUnique({ where: { key: 'blacklist_keywords' } })
-      const keywords = config?.value ? JSON.parse(config.value) : ['basta', 'no molesten', 'no me interesa', 'no, gracias', 'eliminar', 'stop', 'darme de baja']
+      const keywords = config?.value ? JSON.parse(config.value) : ['basta', 'no molesten', 'no me interesa', 'no, gracias', 'eliminar', 'stop', 'darme de baja', 'no quiero que me envien mas mensajes']
       const lowerBody = messageBody.toLowerCase()
       const matched = keywords.find(k => lowerBody.includes(k.toLowerCase()))
 
       if (matched) {
-        const existing = await this.prisma.blacklist.findFirst({ where: { phone: fromPhone } })
+        const cleanPhone = fromPhone.replace(/\D/g, '')
+        const existing = await this.prisma.blacklist.findFirst({ where: { phone: cleanPhone } })
         if (existing) {
           await this.prisma.blacklist.update({ where: { id: existing.id }, data: { reason: `auto: "${matched}"` } })
         } else {
-          await this.prisma.blacklist.create({ data: { phone: fromPhone, reason: `auto: "${matched}"`, owner_id: null } })
+          await this.prisma.blacklist.create({ data: { phone: cleanPhone, reason: `auto: "${matched}"`, owner_id: null } })
         }
 
-        console.log(`🚫 Auto-blacklist: ${fromPhone} por keyword "${matched}"`)
-        this.io.emit('auto_blacklist', { phone: fromPhone, keyword: matched, timestamp: new Date() })
+        console.log(`🚫 Auto-blacklist: ${cleanPhone} por keyword "${matched}"`)
+        this.io.emit('auto_blacklist', { phone: cleanPhone, keyword: matched, timestamp: new Date() })
       }
     } catch (e) {
       console.error('Auto-blacklist error:', e)
@@ -328,8 +369,16 @@ class WAService {
       })
 
       if (recentLog && !recentLog.has_reply) {
-        await this.prisma.campaign_logs.update({ where: { id: recentLog.id }, data: { has_reply: true, replied_at: new Date() } })
-        this.io.emit('campaign_reply', { campaign_id: recentLog.campaign_id, phone: fromPhone, message: messageBody, timestamp: new Date() })
+        await this.prisma.campaign_logs.update({ 
+          where: { id: recentLog.id }, 
+          data: { has_reply: true, replied_at: new Date() } 
+        })
+        this.io.emit('campaign_reply', { 
+          campaign_id: recentLog.campaign_id, 
+          phone: fromPhone, 
+          message: messageBody, 
+          timestamp: new Date() 
+        })
       }
     } catch (e) {
       console.error('Reply tracking error:', e)
