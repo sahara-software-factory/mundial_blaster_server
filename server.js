@@ -1335,26 +1335,29 @@ app.post('/api/campaigns/simulate', authOrSecret, async (req, res) => {
 
 app.get('/api/templates', authOrSecret, async (req, res) => {
   try {
-    const { search, category } = req.query
+    const { search, category, favorite } = req.query
     const where = {}
+    
+    if (req.user?.id) where.owner_id = req.user.id
     
     if (search) {
       where.OR = [
         { name: { contains: search, mode: 'insensitive' } },
-        { content: { contains: search, mode: 'insensitive' } },
+        { content: { contains: search, mode: 'insensitive' } }
       ]
     }
-    if (category && category !== 'all') {
-      where.category = category
-    }
+    
+    if (category) where.category = category
+    if (favorite === 'true') where.isFavorite = true
     
     const templates = await prisma.message_templates.findMany({
       where,
-      orderBy: { usageCount: 'desc' }
+      orderBy: { createdAt: 'desc' }
     })
+    
     res.json({ templates })
   } catch (e) {
-    console.error('Error templates:', e)
+    console.error('Templates list error:', e)
     res.status(500).json({ error: 'Error listando templates' })
   }
 })
