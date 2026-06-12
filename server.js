@@ -1042,19 +1042,31 @@ app.get('/api/campaigns/:id/logs', authOrSecret, requireLicense, async (req, res
 
     // Cruzar con contactos para traer nombre
     const phones = [...new Set(logs.map(l => l.contact_phone))]
-    const contacts = await prisma.contacts.findMany({
-      where: { phone: { in: phones } },
-      select: { phone: true, name: true }
-    })
+    
+    const [contacts, blacklisted] = await Promise.all([
+      prisma.contacts.findMany({
+        where: { phone: { in: phones } },
+        select: { phone: true, name: true }
+      }),
+      prisma.blacklist.findMany({
+        where: { phone: { in: phones } },
+        select: { phone: true, reason: true }
+      })
+    ])
+
     const nameMap = Object.fromEntries(contacts.map(c => [c.phone, c.name]))
+    const blacklistMap = Object.fromEntries(blacklisted.map(b => [b.phone, b.reason]))
 
     const enriched = logs.map(l => ({
       ...l,
-      contact_name: nameMap[l.contact_phone] || null
+      contact_name: nameMap[l.contact_phone] || null,
+      isBlacklisted: !!blacklistMap[l.contact_phone],
+      blacklistReason: blacklistMap[l.contact_phone] || null
     }))
 
     res.json({ logs: enriched })
   } catch (e) {
+    console.error('Logs error:', e)
     res.status(500).json({ error: 'Error obteniendo logs' })
   }
 })
@@ -2036,14 +2048,33 @@ app.post('/api/blacklist', authOrSecret, loadTier, requireFeature('hasBlacklist'
   if (!phone) return res.status(400).json({ error: 'Teléfono requerido' })
   
   try {
-    const entry = await prisma.blacklist.upsert({
-      where: { phone: phone.replace(/\D/g, '') },
-      update: { reason: reason || 'manual' },
-      create: { phone: phone.replace(/\D/g, ''), reason: reason || 'manual' }
+    const cleanPhone = phone.replace(/\D/g, '')
+    
+    // Buscar por phone (sin importar owner_id, porque el auto-blacklist guarda null)
+    const existing = await prisma.blacklist.findFirst({
+      where: { phone: cleanPhone }
     })
+
+    let entry
+    if (existing) {
+      entry = await prisma.blacklist.update({
+        where: { id: existing.id },
+        data: { reason: reason || 'manual' }
+      })
+    } else {
+      entry = await prisma.blacklist.create({
+        data: { 
+          phone: cleanPhone, 
+          reason: reason || 'manual',
+          owner_id: req.user?.id || null 
+        }
+      })
+    }
+
     res.json({ success: true, entry })
   } catch (e) {
-    res.status(500).json({ error: 'Error agregando a blacklist' })
+    console.error('Blacklist POST error:', e)
+    res.status(500).json({ error: 'Error agregando a blacklist', detail: e.message })
   }
 })
 
