@@ -294,15 +294,19 @@ class WAService {
 
       if (cmd === '!blacklist' || cmd.startsWith('!blacklist ')) {
         reason = cmd.replace('!blacklist', '').trim() || 'manual desde chat'
-      } else if (cmd === '!falso') {
+      } else if (cmd === 'falso') {
         reason = 'comprobante falso'
-      } else if (cmd === '!spam') {
+        } else if (cmd === 'comprobante falso') {
+        reason = 'comprobante falso'
+        } else if (cmd === 'falso') {
+        reason = 'Comprobante falso'
+      } else if (cmd === 'spam') {
         reason = 'spam'
-      } else if (cmd === '!ban') {
+      } else if (cmd === 'ban') {
         reason = 'ban manual'
-      } else if (cmd === '!estafa') {
+      } else if (cmd === 'estafa') {
         reason = 'estafa'
-      } else if (cmd === '!no') {
+      } else if (cmd === 'no') {
         reason = 'rechazado por operador'
       }
 

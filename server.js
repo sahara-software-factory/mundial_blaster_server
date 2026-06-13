@@ -101,10 +101,10 @@ function validateLicense(token) {
     }
     
     // Validar issuer (opcional, para rechazar tokens de otra app)
-    if (decoded.iss && decoded.iss !== 'wabisend-v1' && decoded.iss !== 'mundial-blaster-v1') {
-      console.error('❌ Issuer inválido:', decoded.iss)
-      return null
-    }
+    if (decoded.iss !== 'wabisend-v1' && decoded.iss !== 'mundial-blaster-v1') {
+  console.error('❌ Issuer inválido o ausente:', decoded.iss)
+  return null
+}
     
     return decoded
   } catch (e) {
@@ -136,14 +136,28 @@ async function ensureJwtSecret() {
   if (JWT_SECRET) return JWT_SECRET
 
   // 2. Buscar en app_config (generado en ejecuciones anteriores)
-  const config = await prisma.app_config.findUnique({ where: { key: 'jwt_secret' } })
-  if (config?.value) {
-    JWT_SECRET = config.value
-    return JWT_SECRET
+  // DESPUÉS:
+  try {
+    await prisma.app_config.create({ data: { key: 'jwt_secret', value: newSecret } })
+    JWT_SECRET = newSecret
+    console.log('🔐 JWT_SECRET auto-generada y guardada en DB')
+  } catch (e) {
+    const existing = await prisma.app_config.findUnique({ where: { key: 'jwt_secret' } })
+    if (existing?.value) {
+      JWT_SECRET = existing.value
+      console.log('🔐 JWT_SECRET recuperada de DB (otra instancia la creó primero)')
+    } else {
+      throw e
+    }
   }
+  return JWT_SECRET
 
   // 3. Generar una nueva y guardarla
   const crypto = require('crypto')
+  function safeCompare(a, b) {
+  if (!a || !b || a.length !== b.length) return false
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b))
+}
   const newSecret = crypto.randomBytes(64).toString('hex')
   
   await prisma.app_config.create({
@@ -188,12 +202,11 @@ const TIER_LIMITS = {
     hasHumanMode: false,
     hasClone: false,
     hasAdvancedSpintax: false,
-    hasBlacklist: false,
     hasTemplateVars: false,
     hasAI: false,
     hasMultiUser: false,
   },
-  pro: {
+   pro: {
     label: 'Pro',
     maxLines: 5,
     maxTemplates: Infinity,
@@ -207,7 +220,6 @@ const TIER_LIMITS = {
     hasClone: true,
     hasAdvancedSpintax: true,
     hasTemplateVars: true,
-    hasBlacklist: false,
     hasAI: false,
     hasMultiUser: false,
   },
@@ -239,13 +251,6 @@ async function getAppTier() {
   } catch {
     return 'starter'
   }
-}
-
-async function loadTier(req, res, next) {
-  const tier = await getAppTier()
-  req.tier = tier
-  req.tierConfig = TIER_LIMITS[tier] || TIER_LIMITS.starter
-  next()
 }
 
 function requireFeature(feature) {
@@ -339,7 +344,7 @@ io.on('connection', () => console.log('🟢 Socket conectado'))
 // RUTAS
 // ============================================================
 
-app.get('/', (_, res) => res.json({ status: 'OK', service: 'Mundial Blaster', version: '2.0.0' }))
+app.get('/', (_, res) => res.json({ status: 'OK', service: 'Wabisend', version: '2.0.0' }))
 
 // ========== AUTH (TODO PROTEGIDO POR LICENCIA) ==========
 
@@ -2655,11 +2660,11 @@ app.post('/api/affiliate/generate', requireAuth, async (req, res) => {
 
 
 // server.js — endpoint leads/capture
-const LEAD_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycby7QcHgrT6_LJZAv_Z4kw12Hn0Hsvg9r-cxBIucSN9In69KwlL1JdDTOjYJzjAxedFWTQ/exec"
+const LEAD_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwgIDOOTEGgY1pRhJGT9rJkcHlQZWC8XHWC7O5B-_AOLSV-Ar6WyyApY1DsYBM3pSNChQ/exec"
 
 app.post('/api/leads/capture', async (req, res) => {
   try {
-    const { nombre, email, company_name, phone, industry, expected_volume, timezone, fecha, user_id } = req.body
+    const { nombre, email, company_name, phone, industry, expected_volume, timezone, fecha, user_id } = req.body  
     console.log('📥 Lead recibido:', { nombre, email, company_name })
 
     // 1. GUARDAR EN POSTGRESQL
@@ -2672,37 +2677,37 @@ app.post('/api/leads/capture', async (req, res) => {
         industry: industry || null,
         expected_volume: expected_volume || null,
         timezone: timezone || null,
-        user_id: user_id || null,  // ← ahora sí existe en el schema
+        user_id: user_id || null,
       }
     })
     console.log('✅ Lead guardado en DB:', lead.id)
 
-    // 2. INTENTAR GOOGLE SHEET (opcional)
+    // 2. INTENTAR GOOGLE SHEET vía GET (evita 401 de POST anónimo)
     if (LEAD_SHEET_WEBHOOK_URL) {
       try {
-        const params = new URLSearchParams()
-        params.append("nombre", nombre || "")
-        params.append("email", email || "")
-        params.append("company_name", company_name || "")
-        params.append("phone", phone || "")
-        params.append("industry", industry || "")
-        params.append("expected_volume", expected_volume || "")
-        params.append("timezone", timezone || "")
-        params.append("user_id", user_id || "")  // ← también al sheet
-        params.append("fecha", fecha || new Date().toISOString())
+        const url = new URL(LEAD_SHEET_WEBHOOK_URL)
+        url.searchParams.append("nombre", nombre || "")
+        url.searchParams.append("email", email || "")
+        url.searchParams.append("company_name", company_name || "")
+        url.searchParams.append("phone", phone || "")
+        url.searchParams.append("industry", industry || "")
+        url.searchParams.append("expected_volume", expected_volume || "")
+        url.searchParams.append("timezone", timezone || "")
+        url.searchParams.append("user_id", user_id || "")
+        url.searchParams.append("fecha", fecha || new Date().toISOString())
 
-        const sheetRes = await fetch(LEAD_SHEET_WEBHOOK_URL, {
-          method: 'POST',
-          body: params,
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          redirect: 'follow',
+        const sheetRes = await fetch(url.toString(), {
+          method: 'GET',
+          redirect: 'manual',
         })
 
         const responseText = await sheetRes.text()
         console.log('📡 Sheet status:', sheetRes.status)
-        
-        if (responseText.trim().startsWith('<')) {
-          console.warn('⚠️ Sheet devolvió HTML (no JSON). URL incorrecta o no autorizado.')
+
+        if (sheetRes.status >= 300) {
+          console.warn('⚠️ Sheet redirect/auth bloqueado. Status:', sheetRes.status)
+        } else if (responseText.trim().startsWith('<')) {
+          console.warn('⚠️ Sheet devolvió HTML. URL incorrecta o no autorizado.')
         } else {
           console.log('✅ Sheet respondió:', responseText.substring(0, 100))
         }
