@@ -2654,7 +2654,7 @@ const LEAD_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwgIDOOT
 
 app.post('/api/leads/capture', async (req, res) => {
   try {
-    const { nombre, email, company_name, phone, industry, expected_volume, timezone, fecha, user_id } = req.body  
+    const { nombre, email, company_name, phone, industry, expected_volume, timezone, fecha, user_id } = req.body
     console.log('📥 Lead recibido:', { nombre, email, company_name })
 
     // 1. GUARDAR EN POSTGRESQL
@@ -2672,7 +2672,7 @@ app.post('/api/leads/capture', async (req, res) => {
     })
     console.log('✅ Lead guardado en DB:', lead.id)
 
-    // 2. INTENTAR GOOGLE SHEET vía GET (evita 401 de POST anónimo)
+    // 2. ENVIAR A GOOGLE SHEET vía GET
     if (LEAD_SHEET_WEBHOOK_URL) {
       try {
         const url = new URL(LEAD_SHEET_WEBHOOK_URL)
@@ -2688,14 +2688,14 @@ app.post('/api/leads/capture', async (req, res) => {
 
         const sheetRes = await fetch(url.toString(), {
           method: 'GET',
-          redirect: 'manual',
+          redirect: 'follow',
         })
 
         const responseText = await sheetRes.text()
         console.log('📡 Sheet status:', sheetRes.status)
 
-        if (sheetRes.status >= 300) {
-          console.warn('⚠️ Sheet redirect/auth bloqueado. Status:', sheetRes.status)
+        if (!sheetRes.ok) {
+          console.warn('⚠️ Sheet error status:', sheetRes.status, responseText.substring(0, 200))
         } else if (responseText.trim().startsWith('<')) {
           console.warn('⚠️ Sheet devolvió HTML. URL incorrecta o no autorizado.')
         } else {
