@@ -136,28 +136,18 @@ async function ensureJwtSecret() {
   if (JWT_SECRET) return JWT_SECRET
 
   // 2. Buscar en app_config (generado en ejecuciones anteriores)
-  // DESPUÉS:
-  try {
-    await prisma.app_config.create({ data: { key: 'jwt_secret', value: newSecret } })
-    JWT_SECRET = newSecret
-    console.log('🔐 JWT_SECRET auto-generada y guardada en DB')
-  } catch (e) {
-    const existing = await prisma.app_config.findUnique({ where: { key: 'jwt_secret' } })
-    if (existing?.value) {
-      JWT_SECRET = existing.value
-      console.log('🔐 JWT_SECRET recuperada de DB (otra instancia la creó primero)')
-    } else {
-      throw e
-    }
+  const config = await prisma.app_config.findUnique({ where: { key: 'jwt_secret' } })
+  if (config?.value) {
+    JWT_SECRET = config.value
+    return JWT_SECRET
   }
-  return JWT_SECRET
 
   // 3. Generar una nueva y guardarla
   const crypto = require('crypto')
-  function safeCompare(a, b) {
-  if (!a || !b || a.length !== b.length) return false
-  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b))
-}
+//   function safeCompare(a, b) {
+//   if (!a || !b || a.length !== b.length) return false
+//   return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b))
+// }
   const newSecret = crypto.randomBytes(64).toString('hex')
   
   await prisma.app_config.create({
