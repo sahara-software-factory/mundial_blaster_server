@@ -2656,20 +2656,21 @@ const LEAD_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSd08wab16okX5bOc
 // ↑↑↑ REEMPLAZAR 1FAIpQLSfxxxxx con tu ID real del formulario
 
 const FORM_ENTRIES = {
-  fecha:         "entry.1504608396",  // ← REEMPLAZAR con tus 9 IDs reales
-  nombre:        "entry.526756410",
-  email:         "entry.1175047149",
-  company_name:  "entry.1071200091",
+
+  nombre:        "entry.1504608396",
+  email:         "entry.526756410",
+  company_name:  "entry.2059667152",
   phone:         "entry.1175047149",
-  industry:      "entry.2059667152",
-  expected_volume: "entry.1357054727",
-  timezone:      "entry.1212091875",
-  user_id:       "entry.2059667152",
+  industry:      "entry.1212091875",
+  affiliate_code: "entry.1172118810",
+  expected_volume: "entry.1071200091",
+  timezone:      "entry.1357054727",
+  user_id:       "entry.202333793",
 }
 
 app.post('/api/leads/capture', async (req, res) => {
   try {
-    const { nombre, email, company_name, phone, industry, expected_volume, timezone, fecha, user_id } = req.body
+    const { nombre, email, company_name, affiliate_code, phone, industry, expected_volume, timezone,  user_id } = req.body
     console.log('📥 Lead recibido:', { nombre, email, company_name })
 
     // 1. GUARDAR EN POSTGRESQL
@@ -2680,6 +2681,7 @@ app.post('/api/leads/capture', async (req, res) => {
         company_name: company_name || null,
         phone: phone || null,
         industry: industry || null,
+        affiliate_code: affiliate_code || null,
         expected_volume: expected_volume || null,
         timezone: timezone || null,
         user_id: user_id || null,
@@ -2690,10 +2692,11 @@ app.post('/api/leads/capture', async (req, res) => {
     // 2. ENVIAR A GOOGLE FORM (transparente, sin auth, sin mails)
     try {
       const params = new URLSearchParams()
-      params.append(FORM_ENTRIES.fecha, fecha || new Date().toISOString())
       params.append(FORM_ENTRIES.nombre, nombre || "")
       params.append(FORM_ENTRIES.email, email || "")
+      params.append(FORM_ENTRIES.affiliate_code, affiliate_code || "")
       params.append(FORM_ENTRIES.company_name, company_name || "")
+
       params.append(FORM_ENTRIES.phone, phone || "")
       params.append(FORM_ENTRIES.industry, industry || "")
       params.append(FORM_ENTRIES.expected_volume, expected_volume || "")
