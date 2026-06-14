@@ -2649,8 +2649,23 @@ app.post('/api/affiliate/generate', requireAuth, async (req, res) => {
 })
 
 
-// server.js — endpoint leads/capture
-const LEAD_SHEET_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwgIDOOTEGgY1pRhJGT9rJkcHlQZWC8XHWC7O5B-_AOLSV-Ar6WyyApY1DsYBM3pSNChQ/exec"
+// ============================================
+// GOOGLE FORM - LEAD CAPTURE (HARDCODEADO)
+// ============================================
+const LEAD_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSd08wab16okX5bOc0T0NZlYD9wiZQf6yykAwTHgAzNIY72T9g/formResponse"
+// ↑↑↑ REEMPLAZAR 1FAIpQLSfxxxxx con tu ID real del formulario
+
+const FORM_ENTRIES = {
+  fecha:         "entry.1504608396",  // ← REEMPLAZAR con tus 9 IDs reales
+  nombre:        "entry.526756410",
+  email:         "entry.1175047149",
+  company_name:  "entry.1071200091",
+  phone:         "entry.1175047149",
+  industry:      "entry.2059667152",
+  expected_volume: "entry.1357054727",
+  timezone:      "entry.1212091875",
+  user_id:       "entry.2059667152",
+}
 
 app.post('/api/leads/capture', async (req, res) => {
   try {
@@ -2672,41 +2687,33 @@ app.post('/api/leads/capture', async (req, res) => {
     })
     console.log('✅ Lead guardado en DB:', lead.id)
 
-    // 2. ENVIAR A GOOGLE SHEET vía GET
-    if (LEAD_SHEET_WEBHOOK_URL) {
-      try {
-        const url = new URL(LEAD_SHEET_WEBHOOK_URL)
-        url.searchParams.append("nombre", nombre || "")
-        url.searchParams.append("email", email || "")
-        url.searchParams.append("company_name", company_name || "")
-        url.searchParams.append("phone", phone || "")
-        url.searchParams.append("industry", industry || "")
-        url.searchParams.append("expected_volume", expected_volume || "")
-        url.searchParams.append("timezone", timezone || "")
-        url.searchParams.append("user_id", user_id || "")
-        url.searchParams.append("fecha", fecha || new Date().toISOString())
+    // 2. ENVIAR A GOOGLE FORM (transparente, sin auth, sin mails)
+    try {
+      const params = new URLSearchParams()
+      params.append(FORM_ENTRIES.fecha, fecha || new Date().toISOString())
+      params.append(FORM_ENTRIES.nombre, nombre || "")
+      params.append(FORM_ENTRIES.email, email || "")
+      params.append(FORM_ENTRIES.company_name, company_name || "")
+      params.append(FORM_ENTRIES.phone, phone || "")
+      params.append(FORM_ENTRIES.industry, industry || "")
+      params.append(FORM_ENTRIES.expected_volume, expected_volume || "")
+      params.append(FORM_ENTRIES.timezone, timezone || "")
+      params.append(FORM_ENTRIES.user_id, user_id || "")
 
-        const sheetRes = await fetch(url.toString(), {
-          method: 'GET',
-          redirect: 'follow',
-        })
+      const formUrl = `${LEAD_FORM_URL}?${params.toString()}`
+      
+      const formRes = await fetch(formUrl, { method: 'GET' })
 
-        const responseText = await sheetRes.text()
-        console.log('📡 Sheet status:', sheetRes.status)
-
-        if (!sheetRes.ok) {
-          console.warn('⚠️ Sheet error status:', sheetRes.status, responseText.substring(0, 200))
-        } else if (responseText.trim().startsWith('<')) {
-          console.warn('⚠️ Sheet devolvió HTML. URL incorrecta o no autorizado.')
-        } else {
-          console.log('✅ Sheet respondió:', responseText.substring(0, 100))
-        }
-      } catch (sheetError) {
-        console.warn('⚠️ Sheet falló (no crítico):', sheetError.message)
+      if (formRes.status === 200 || formRes.status === 302) {
+        console.log('✅ Lead enviado a Google Form')
+      } else {
+        console.warn('⚠️ Form status:', formRes.status)
       }
+    } catch (formError) {
+      console.warn('⚠️ Form falló (no crítico):', formError.message)
     }
 
-    res.json({ success: true, lead_id: lead.id, sheet_attempted: !!LEAD_SHEET_WEBHOOK_URL })
+    res.json({ success: true, lead_id: lead.id })
 
   } catch (e) {
     console.error('❌ Lead capture error:', e)
