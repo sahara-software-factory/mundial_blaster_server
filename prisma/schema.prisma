@@ -62,6 +62,7 @@ model leads {
   nombre          String
   email           String
   company_name    String?
+  affiliate_code  String?
   phone           String?
   industry        String?
   expected_volume String?
