@@ -1537,7 +1537,9 @@ app.post('/api/lineas/connect', authOrSecret, requireLicense, async (req, res) =
 
 app.get('/api/lineas', authOrSecret, requireLicense, async (req, res) => {
   try {
+    const userId = req.user?.sub || req.user?.id || req.userId
     const lines = await prisma.lineas_whatsapp.findMany({
+      where: userId ? { owner_id: userId } : undefined,
       orderBy: { fecha_creacion: 'desc' }
     })
     res.json({ lines })
@@ -1551,7 +1553,12 @@ app.post('/api/lineas', authOrSecret, requireLicense, loadTier, async (req, res)
   if (!phone) return res.status(400).json({ error: 'phone required' })
 
   try {
-    const activeLines = await prisma.lineas_whatsapp.count()
+    const userId = req.user?.sub || req.user?.id || req.userId
+
+    // Contar SOLO las líneas de este usuario
+    const activeLines = await prisma.lineas_whatsapp.count({
+      where: userId ? { owner_id: userId } : undefined
+    })
 
     if (activeLines >= req.tierConfig.maxLines) {
       return res.status(403).json({
@@ -1569,7 +1576,8 @@ app.post('/api/lineas', authOrSecret, requireLicense, loadTier, async (req, res)
       data: {
         phone,
         nombre: nombre || 'Nueva Línea',
-        status: 'DESCONECTADA'
+        status: 'DESCONECTADA',
+        owner_id: userId || null
       }
     })
     res.json({ success: true, line })
