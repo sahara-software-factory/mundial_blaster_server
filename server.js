@@ -198,7 +198,7 @@ const TIER_LIMITS = {
   },
    pro: {
     label: 'Pro',
-    maxLines: 5,
+    maxLines: 3,
     maxTemplates: Infinity,
     maxPendingCampaigns: 50,
     hasBlacklist: true,
@@ -2666,6 +2666,7 @@ const FORM_ENTRIES = {
   expected_volume: "entry.1071200091",
   timezone:      "entry.1357054727",
   user_id:       "entry.202333793",
+  
 }
 
 app.post('/api/leads/capture', async (req, res) => {
@@ -2782,10 +2783,12 @@ app.post('/api/proxy/history', authOrSecret, async (req, res) => {
 
 // CRON
 
+// CRON
 cron.schedule('*/5 * * * *', async () => {
   try {
-        const now = new Date()
-        const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000)
+    const now = new Date()
+    const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000)
+    
     const pending = await prisma.scheduled_campaigns.findMany({
       where: {
         status: 'pending',
@@ -2832,17 +2835,27 @@ cron.schedule('*/5 * * * *', async () => {
         continue
       }
 
+      // 🔥 FIX: Parsear los targets por las dudas
+      let parsedTargets = [];
+      try {
+        parsedTargets = typeof campaign.targets === 'string' ? JSON.parse(campaign.targets) : campaign.targets;
+      } catch (e) {
+        console.error('Error parseando targets:', e);
+      }
+
       // Marcar running y disparar
       await prisma.campaigns.update({
         where: { id: campaign.id },
         data: { status: 'running' }
       }).catch(() => {})
 
-      waService.sendCampaign(campaign.id, lineasSeleccionadas, campaign.targets, campaign.message, {
+      // Disparamos la promesa en segundo plano
+      waService.sendCampaign(campaign.id, lineasSeleccionadas, parsedTargets, campaign.message, {
         delayMin: 5000,
         delayMax: 12000,
         imageUrl: campaign.image_url,
-        humanMode: campaign.human_mode === true
+        humanMode: campaign.human_mode === true,
+        skipBlacklist: true // 🔥 FIX: ¡Escudo activado para el envío en piloto automático!
       }).then(async () => {
         await prisma.scheduled_campaigns.update({
           where: { id: sched.id },
