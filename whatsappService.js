@@ -40,6 +40,7 @@ class WAService {
     this.sessionsDir = '/app/sessions'
     this.msgRetryCounterCache = new NodeCache()
     this.lidCache = new Map()
+    this.lineOwners = new Map()
     this.maxLidCacheSize = 5000
     fs.ensureDirSync(this.sessionsDir)
   }
@@ -77,6 +78,9 @@ class WAService {
         return
       }
       const lineId = line.id
+      const ownerId = line.owner_id || null
+      this.lineOwners.set(lineId, ownerId) // ← cachear owner
+      const sessionPath = path.join(this.sessionsDir, String(lineId))
       const sessionPath = path.join(this.sessionsDir, String(lineId))
       const existing = this.clients.get(lineId)
       if (existing) {
@@ -123,7 +127,12 @@ class WAService {
       if (qr) {
         try {
           const qrDataUrl = await QRCode.toDataURL(qr)
-          this.io.emit('qr', { lineId, qr: qrDataUrl })
+          const ownerId = this.lineOwners.get(lineId)
+          if (ownerId && this.io.emitToUser) {
+            this.io.emitToUser(ownerId, 'qr', { lineId, qr: qrDataUrl })
+          } else {
+            this.io.emit('qr', { lineId, qr: qrDataUrl })
+          }
           await this.prisma.lineas_whatsapp.update({
             where: { id: lineId },
             data: { status: 'PENDING' }
@@ -151,7 +160,12 @@ class WAService {
             }
           } catch (e) {}
         }, 180000)
-        this.io.emit('status', { lineId, status: 'CONECTADA' })
+                const ownerId = this.lineOwners.get(lineId)
+        if (ownerId && this.io.emitToUser) {
+          this.io.emitToUser(ownerId, 'status', { lineId, status: 'CONECTADA' })
+        } else {
+          this.io.emit('status', { lineId, status: 'CONECTADA' })
+        }
         await this.prisma.lineas_whatsapp.update({
           where: { id: lineId },
           data: { status: 'CONECTADA' }
@@ -174,7 +188,13 @@ class WAService {
             where: { id: lineId },
             data: { status: 'DESCONECTADA' }
           }).catch(() => {})
-          this.io.emit('status', { lineId, status: 'DESCONECTADA', reason: 'SESSION_INVALID', phone: maskPhone(phone) })
+                    const ownerId = this.lineOwners.get(lineId)
+          const payload = { lineId, status: 'DESCONECTADA', reason: 'SESSION_INVALID', phone: maskPhone(phone) }
+          if (ownerId && this.io.emitToUser) {
+            this.io.emitToUser(ownerId, 'status', payload)
+          } else {
+            this.io.emit('status', payload)
+          }
           return
         }
         if (shouldReconnect) {
@@ -205,7 +225,13 @@ class WAService {
             where: { id: lineId },
             data: { status: 'DESCONECTADA' }
           }).catch(() => {})
-          this.io.emit('status', { lineId, status: 'DESCONECTADA', reason: 'LOGOUT' })
+                    const ownerId = this.lineOwners.get(lineId)
+          const payload = { lineId, status: 'DESCONECTADA', reason: 'LOGOUT' }
+          if (ownerId && this.io.emitToUser) {
+            this.io.emitToUser(ownerId, 'status', payload)
+          } else {
+            this.io.emit('status', payload)
+          }
         }
       }
     })
@@ -279,12 +305,19 @@ class WAService {
                 create: { phone: cleanPhone, reason, owner_id: null }
               })
               console.log(`🛡️ Operador marcó blacklist: ${maskPhone(cleanPhone)} → ${reason}`)
-              this.io.emit('operator_blacklist', {
-                phone: cleanPhone,
-                reason,
-                timestamp: new Date(),
-                entry
-              })
+                        // Self-hosted: buscar el único usuario o usar owner del blacklist entry
+          const ownerId = entry?.owner_id || this.lineOwners.get(lineId) || null
+          const payload = { 
+            phone: cleanPhone, 
+            reason, 
+            timestamp: new Date(),
+            entry 
+          }
+          if (ownerId && this.io.emitToUser) {
+            this.io.emitToUser(ownerId, 'operator_blacklist', payload)
+          } else {
+            this.io.emit('operator_blacklist', payload)
+          }
             } catch (e) {
               console.error('Operator blacklist error:', e)
             }
@@ -306,7 +339,13 @@ class WAService {
               await this.prisma.blacklist.create({ data: { phone: cleanPhone, reason: `auto: "${matched}"`, owner_id: null } })
             }
             console.log(`🚫 Auto-blacklist: ${maskPhone(cleanPhone)} por keyword "${matched}"`)
-            this.io.emit('auto_blacklist', { phone: cleanPhone, keyword: matched, timestamp: new Date() })
+                    const ownerId = this.lineOwners.get(lineId) || null
+        const payload = { phone: cleanPhone, keyword: matched, timestamp: new Date() }
+        if (ownerId && this.io.emitToUser) {
+          this.io.emitToUser(ownerId, 'auto_blacklist', payload)
+        } else {
+          this.io.emit('auto_blacklist', payload)
+        }
           }
         } catch (e) {
           console.error('Auto-blacklist error:', e)
@@ -326,12 +365,18 @@ class WAService {
               where: { id: recentLog.id },
               data: { has_reply: true, replied_at: new Date() }
             })
-            this.io.emit('campaign_reply', {
-              campaign_id: recentLog.campaign_id,
-              phone: fromPhone,
-              message: messageBody,
-              timestamp: new Date()
-            })
+                        const ownerId = recentLog.owner_id || null
+            const payload = { 
+              campaign_id: recentLog.campaign_id, 
+              phone: fromPhone, 
+              message: messageBody, 
+              timestamp: new Date() 
+            }
+            if (ownerId && this.io.emitToUser) {
+              this.io.emitToUser(ownerId, 'campaign_reply', payload)
+            } else {
+              this.io.emit('campaign_reply', payload)
+            }
           }
         } catch (e) {
           console.error('Reply tracking error:', e)
@@ -637,20 +682,25 @@ class WAService {
               owner_id: options.ownerId || null,
             }
           }).catch(() => {})
-          this.io.emit('campaign_log', {
-            campaignId: campaignId,
-            campaign_id: campaignId,
-            phone: target.phone,
-            contact_phone: target.phone,
-            status: 'failed',
-            lineId: null,
-            line_id: null,
-            linePhone: null,
-            line_phone: null,
-            error: 'TODAS LAS LÍNEAS CAÍDAS - CAMPAÑA DETENIDA',
-            progress: `${i + 1}/${targets.length}`,
-            isEmergencyStop: true
-          })
+                const ownerId = options.ownerId || null
+      const payload = {
+        campaignId: campaignId,
+        campaign_id: campaignId,
+        phone: target.phone,
+        contact_phone: target.phone,
+        status: 'sent',
+        lineId: lineaAsignada.id,
+        line_id: lineaAsignada.id,
+        linePhone: lineaAsignada.phone,
+        delayMs: lastDelayMs,
+        line_phone: lineaAsignada.phone,
+        progress: `${i + 1}/${targets.length}`
+      }
+      if (ownerId && this.io.emitToUser) {
+        this.io.emitToUser(ownerId, 'campaign_log', payload)
+      } else {
+        this.io.emit('campaign_log', payload)
+      }
           wasCancelled = true
           break
         }
@@ -822,7 +872,8 @@ class WAService {
       failed: results.filter(r => r.status === 'failed').length
     })
 
-    this.io.emit('campaign_complete', {
+        const ownerId = options.ownerId || null
+    const payload = {
       campaignId: campaignId,
       campaign_id: campaignId,
       status: finalStatus,
@@ -830,7 +881,12 @@ class WAService {
       failed: results.filter(r => r.status === 'failed').length,
       total_sent: results.filter(r => r.status === 'sent').length,
       total_failed: results.filter(r => r.status === 'failed').length
-    })
+    }
+    if (ownerId && this.io.emitToUser) {
+      this.io.emitToUser(ownerId, 'campaign_complete', payload)
+    } else {
+      this.io.emit('campaign_complete', payload)
+    }
 
     console.log(`[CAMPAIGN] ${campaignId} finalizada. Results:`, results.length, 'sent:', results.filter(r => r.status === 'sent').length, 'failed:', results.filter(r => r.status === 'failed').length)
 
@@ -862,6 +918,7 @@ class WAService {
     try {
       const exists = await this.prisma.lineas_whatsapp.findUnique({ where: { id: lineId } })
       if (exists) {
+        this.lineOwners.delete(lineId)
         await this.prisma.lineas_whatsapp.update({
           where: { id: lineId },
           data: { status: 'DESCONECTADA' }

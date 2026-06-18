@@ -43,8 +43,37 @@ app.use(cors({
 }))
 
 const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] },
+  cors: { 
+    origin: allowedOrigins, 
+    methods: ['GET', 'POST'],
+    credentials: true 
+  },
 })
+
+// 🔒 Middleware de autenticación en Socket.IO
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token || 
+                socket.handshake.headers?.authorization?.replace('Bearer ', '')
+  if (!token) return next(new Error('No autenticado'))
+  const decoded = verifyToken(token)
+  if (!decoded) return next(new Error('Token inválido'))
+  socket.userId = decoded.userId
+  next()
+})
+
+io.on('connection', (socket) => {
+  console.log('🟢 Socket conectado:', socket.userId)
+  socket.join(`user:${socket.userId}`)
+})
+
+// Helper para emitir solo al usuario dueño
+io.emitToUser = (userId, event, payload) => {
+  if (!userId) {
+    io.emit(event, payload) // fallback solo si no hay userId
+  } else {
+    io.to(`user:${userId}`).emit(event, payload)
+  }
+}
 
 // Headers de seguridad
 app.use(helmet())
@@ -176,6 +205,7 @@ const TIER_LIMITS = {
     maxLines: 3,
     maxTemplates: Infinity,
     maxPendingCampaigns: 50,
+    hasTemplateFavorite: true,
     hasBlacklist: true,
     hasAdvancedReports: true,
     hasCron: true,
@@ -192,6 +222,7 @@ const TIER_LIMITS = {
     label: 'Business',
     maxLines: Infinity,
     maxTemplates: Infinity,
+    hasTemplateFavorite: true,
     maxPendingCampaigns: Infinity,
     hasBlacklist: true,
     hasAdvancedReports: true,
@@ -922,7 +953,7 @@ app.post('/api/templates/:id/use', authOrSecret, async (req, res) => {
   }
 })
 
-app.patch('/api/templates/:id/favorite', authOrSecret, async (req, res) => {
+app.patch('/api/templates/:id/favorite', loadTier, requireFeature('hasTemplateFavorite'), authOrSecret, async (req, res) => {
   try {
     const { id } = req.params
     const template = await prisma.message_templates.findUnique({
@@ -1775,8 +1806,11 @@ app.delete('/api/blacklist/:phone', authOrSecret, loadTier, requireFeature('hasB
   }
 })
 
-// ========== AI ==========
-app.get('/api/ai/prompts', authOrSecret, async (req, res) => {
+// ========== AI (blindado por licencia Business) ==========
+const aiRouter = express.Router()
+aiRouter.use(authOrSecret, loadTier, requireFeature('hasAI'))
+
+aiRouter.get('/prompts', async (req, res) => {
   try {
     const where = req.user?.id ? { OR: [{ owner_id: req.user.id }, { owner_id: null }] } : {}
     const prompts = await prisma.ai_prompts.findMany({
@@ -1790,7 +1824,7 @@ app.get('/api/ai/prompts', authOrSecret, async (req, res) => {
   }
 })
 
-app.post('/api/ai/prompts', authOrSecret, async (req, res) => {
+aiRouter.post('/prompts', async (req, res) => {
   try {
     const { title, instruction, results } = req.body
     if (!title || !instruction) {
@@ -1811,7 +1845,7 @@ app.post('/api/ai/prompts', authOrSecret, async (req, res) => {
   }
 })
 
-app.delete('/api/ai/prompts/:id', authOrSecret, async (req, res) => {
+aiRouter.delete('/prompts/:id', async (req, res) => {
   try {
     if (!req.user?.id) return res.status(401).json({ error: 'Requiere sesión de usuario' })
     await prisma.ai_prompts.delete({
@@ -1824,82 +1858,7 @@ app.delete('/api/ai/prompts/:id', authOrSecret, async (req, res) => {
   }
 })
 
-app.get('/api/openai/config', authOrSecret, async (req, res) => {
-  try {
-    const config = await prisma.openai_config.findFirst({
-      where: req.user?.id ? { owner_id: req.user.id, active: true } : { active: true },
-      orderBy: { updatedAt: 'desc' }
-    })
-    if (!config) return res.json({ hasKey: false })
-    res.json({
-      hasKey: true,
-      model: config.model,
-      keyPreview: `${config.api_key.slice(0, 8)}...${config.api_key.slice(-4)}`
-    })
-  } catch (e) {
-    console.error('Error leyendo config OpenAI:', e)
-    res.status(500).json({ error: 'Error leyendo configuración' })
-  }
-})
-
-app.post('/api/openai/config', authOrSecret, async (req, res) => {
-  try {
-    const { apiKey, model = 'gpt-4o-mini' } = req.body
-    if (!apiKey?.startsWith('sk-')) {
-      return res.status(400).json({ error: 'API key inválida' })
-    }
-    const testRes = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [{ role: 'user', content: 'Say OK' }],
-        max_tokens: 5
-      })
-    })
-    if (!testRes.ok) throw new Error('API key inválida')
-    if (req.user?.id) {
-      await prisma.openai_config.updateMany({
-        where: { owner_id: req.user.id },
-        data: { active: false }
-      })
-    }
-    const config = await prisma.openai_config.create({
-      data: {
-        owner_id: req.user?.id || null,
-        api_key: apiKey,
-        model,
-        active: true
-      }
-    })
-    res.json({
-      success: true,
-      model: config.model,
-      keyPreview: `${apiKey.slice(0, 8)}...${apiKey.slice(-4)}`
-    })
-  } catch (e) {
-    console.error('Error guardando config OpenAI:', e)
-    res.status(500).json({ error: e.message || 'Error verificando/guardando key' })
-  }
-})
-
-app.delete('/api/openai/config', authOrSecret, async (req, res) => {
-  try {
-    const where = req.user?.id ? { owner_id: req.user.id } : {}
-    await prisma.openai_config.updateMany({
-      where,
-      data: { active: false }
-    })
-    res.json({ success: true })
-  } catch (e) {
-    res.status(500).json({ error: 'Error eliminando config' })
-  }
-})
-
-app.post('/api/ai/generate', authOrSecret, async (req, res) => {
+aiRouter.post('/generate', async (req, res) => {
   try {
     const { instruction, temperature = 0.85, maxTokens = 1200 } = req.body
     if (!instruction?.trim()) return res.status(400).json({ error: 'Instrucción requerida' })
@@ -1953,7 +1912,7 @@ REGLAS OBLIGATORIAS:
   }
 })
 
-app.post('/api/ai/audit', authOrSecret, async (req, res) => {
+aiRouter.post('/audit', async (req, res) => {
   try {
     const { message } = req.body
     if (!message) return res.status(400).json({ error: 'Mensaje requerido' })
@@ -2013,7 +1972,7 @@ app.post('/api/ai/audit', authOrSecret, async (req, res) => {
   }
 })
 
-app.post('/api/ai/title', authOrSecret, async (req, res) => {
+aiRouter.post('/title', async (req, res) => {
   try {
     const { message } = req.body
     if (!message) return res.status(400).json({ error: 'Mensaje requerido' })
@@ -2049,7 +2008,7 @@ app.post('/api/ai/title', authOrSecret, async (req, res) => {
   }
 })
 
-app.get('/api/ai/estimate', authOrSecret, async (req, res) => {
+aiRouter.get('/estimate', async (req, res) => {
   try {
     const startOfMonth = new Date()
     startOfMonth.setDate(1)
@@ -2075,7 +2034,7 @@ app.get('/api/ai/estimate', authOrSecret, async (req, res) => {
   }
 })
 
-app.post('/api/ai/summary', authOrSecret, async (req, res) => {
+aiRouter.post('/summary', async (req, res) => {
   console.log('🎯 ENTRÓ a /api/ai/summary', req.body)
   try {
     const { campaignId, sent, failed, total } = req.body
@@ -2128,7 +2087,86 @@ app.post('/api/ai/summary', authOrSecret, async (req, res) => {
   }
 })
 
-app.get('/api/me/ai-features', authOrSecret, async (req, res) => {
+app.use('/api/ai', aiRouter)
+
+// OpenAI Config (también blindado por hasAI)
+app.get('/api/openai/config', authOrSecret, loadTier, requireFeature('hasAI'), async (req, res) => {
+  try {
+    const config = await prisma.openai_config.findFirst({
+      where: req.user?.id ? { owner_id: req.user.id, active: true } : { active: true },
+      orderBy: { updatedAt: 'desc' }
+    })
+    if (!config) return res.json({ hasKey: false })
+    res.json({
+      hasKey: true,
+      model: config.model,
+      keyPreview: `${config.api_key.slice(0, 8)}...${config.api_key.slice(-4)}`
+    })
+  } catch (e) {
+    console.error('Error leyendo config OpenAI:', e)
+    res.status(500).json({ error: 'Error leyendo configuración' })
+  }
+})
+
+app.post('/api/openai/config', authOrSecret, loadTier, requireFeature('hasAI'), async (req, res) => {
+  try {
+    const { apiKey, model = 'gpt-4o-mini' } = req.body
+    if (!apiKey?.startsWith('sk-')) {
+      return res.status(400).json({ error: 'API key inválida' })
+    }
+    const testRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: 'Say OK' }],
+        max_tokens: 5
+      })
+    })
+    if (!testRes.ok) throw new Error('API key inválida')
+    if (req.user?.id) {
+      await prisma.openai_config.updateMany({
+        where: { owner_id: req.user.id },
+        data: { active: false }
+      })
+    }
+    const config = await prisma.openai_config.create({
+      data: {
+        owner_id: req.user?.id || null,
+        api_key: apiKey,
+        model,
+        active: true
+      }
+    })
+    res.json({
+      success: true,
+      model: config.model,
+      keyPreview: `${apiKey.slice(0, 8)}...${apiKey.slice(-4)}`
+    })
+  } catch (e) {
+    console.error('Error guardando config OpenAI:', e)
+    res.status(500).json({ error: e.message || 'Error verificando/guardando key' })
+  }
+})
+
+app.delete('/api/openai/config', authOrSecret, loadTier, requireFeature('hasAI'), async (req, res) => {
+  try {
+    const where = req.user?.id ? { owner_id: req.user.id } : {}
+    await prisma.openai_config.updateMany({
+      where,
+      data: { active: false }
+    })
+    res.json({ success: true })
+  } catch (e) {
+    res.status(500).json({ error: 'Error eliminando config' })
+  }
+})
+
+// AI Features toggles (también blindado por hasAI)
+app.get('/api/me/ai-features', authOrSecret, loadTier, requireFeature('hasAI'), async (req, res) => {
   try {
     if (!req.user?.id) return res.status(401).json({ error: 'Requiere sesión de usuario' })
     const user = await prisma.usuarios.findUnique({
@@ -2146,7 +2184,7 @@ app.get('/api/me/ai-features', authOrSecret, async (req, res) => {
   }
 })
 
-app.patch('/api/me/ai-features', authOrSecret, async (req, res) => {
+app.patch('/api/me/ai-features', authOrSecret, loadTier, requireFeature('hasAI'), async (req, res) => {
   try {
     if (!req.user?.id) return res.status(401).json({ error: 'Requiere sesión de usuario' })
     const { feature, enabled } = req.body
@@ -2256,7 +2294,7 @@ app.post('/api/leads/capture', async (req, res) => {
 })
 
 // ========== PROXY ==========
-app.get('/api/proxy/history', authOrSecret, async (req, res) => {
+app.get('/api/proxy/history', loadTier, requireFeature('hasProxyRotate'), authOrSecret, async (req, res) => {
   try {
     const where = req.user?.id ? { owner_id: req.user.id } : {}
     const history = await prisma.proxy_history.findMany({
@@ -2271,7 +2309,7 @@ app.get('/api/proxy/history', authOrSecret, async (req, res) => {
   }
 })
 
-app.post('/api/proxy/history', authOrSecret, async (req, res) => {
+app.post('/api/proxy/history', loadTier, requireFeature('hasProxyRotate'), authOrSecret, async (req, res) => {
   try {
     const { city, country, code, fakeIp, latency } = req.body
     if (!city || !fakeIp) return res.status(400).json({ error: 'Datos incompletos' })
