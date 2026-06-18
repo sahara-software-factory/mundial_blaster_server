@@ -1013,6 +1013,33 @@ app.post('/api/lineas/logout', authOrSecret, requireLicense, async (req, res) =>
   }
 })
 
+app.delete('/api/lineas/:id', authOrSecret, requireLicense, async (req, res) => {
+  try {
+    const { id } = req.params
+    const userId = req.user?.id || null
+
+    // Verificar que la línea existe y pertenece al usuario
+    const line = await prisma.lineas_whatsapp.findFirst({
+      where: {
+        id,
+        ...(userId ? { OR: [{ owner_id: userId }, { owner_id: null }] } : {})
+      }
+    })
+    if (!line) return res.status(404).json({ error: 'Línea no encontrada' })
+
+    // Desconectar primero si está conectada (limpia socket + disco)
+    await waService.logout(id).catch(() => {})
+
+    // Eliminar de la DB
+    await prisma.lineas_whatsapp.delete({ where: { id } })
+
+    res.json({ success: true, deleted: id })
+  } catch (e) {
+    console.error('Error eliminando línea:', e)
+    res.status(500).json({ error: 'Error eliminando línea' })
+  }
+})
+
 // ========== CAMPAÑAS ==========
 app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (req, res) => {
   try {

@@ -837,7 +837,7 @@ class WAService {
     return results
   }
 
-  async logout(lineId) {
+      async logout(lineId) {
     if (this.reconnectTimers[lineId]) {
       clearTimeout(this.reconnectTimers[lineId])
       delete this.reconnectTimers[lineId]
@@ -848,14 +848,28 @@ class WAService {
     }
     const client = this.clients.get(lineId)
     if (client) {
-      try { await client.logout() } catch {}
+      try { await client.logout() } catch (e) {
+        console.log(`⚠️ Logout Baileys falló (ya desconectado?): ${e.message}`)
+      }
       this.clients.delete(lineId)
     }
-    await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
-    await this.prisma.lineas_whatsapp.update({
-      where: { id: lineId },
-      data: { status: 'DESCONECTADA' }
-    }).catch(() => {})
+    try {
+      const sessionPath = path.join(this.sessionsDir, String(lineId))
+      if (fs.existsSync(sessionPath)) await fs.remove(sessionPath)
+    } catch (e) {
+      console.log(`⚠️ No se pudo eliminar carpeta de sesión: ${e.message}`)
+    }
+    try {
+      const exists = await this.prisma.lineas_whatsapp.findUnique({ where: { id: lineId } })
+      if (exists) {
+        await this.prisma.lineas_whatsapp.update({
+          where: { id: lineId },
+          data: { status: 'DESCONECTADA' }
+        })
+      }
+    } catch (e) {
+      console.log(`⚠️ Error actualizando status: ${e.message}`)
+    }
     return { success: true }
   }
 }
