@@ -1283,6 +1283,209 @@ app.get('/api/campaigns', authOrSecret, requireLicense, async (req, res) => {
   }
 })
 
+app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
+  try {
+    const { period } = req.query
+        console.log('📊 REPORT DEBUG ==================')
+    console.log('📊 tier:', req.tier)
+    console.log('📊 userId:', req.user?.id || 'null/undefined')
+    console.log('📊 period param:', period)
+    let dateFilter = {}
+    if (req.tier === 'starter') {
+    console.log('📊 Applying STARTER filter: 30d')
+      dateFilter = { created_at: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } }
+    } else {
+    console.log('📊 Applying PRO/BUSINESS filter for period:', period)
+      if (period === '7d') {
+        dateFilter = { created_at: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } }
+      } else if (period === '30d') {
+        dateFilter = { created_at: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } }
+      } else if (period === '90d') {
+        dateFilter = { created_at: { gte: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) } }
+      } else if (period === 'all') {
+        dateFilter = {}
+      } else {
+        dateFilter = { created_at: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } }
+      }
+    }
+    const userId = req.user?.id || null
+    console.log('📊 dateFilter:', JSON.stringify(dateFilter))
+    console.log('📊 userId for where:', userId)
+    const campaigns = await prisma.campaigns.findMany({
+      where: {
+        ...dateFilter,
+        ...(userId ? { OR: [{ owner_id: userId }, { owner_id: null }] } : {})
+      },
+      orderBy: { created_at: 'desc' }
+    })
+
+    console.log('📊 campaigns found:', campaigns.length)
+    if (campaigns.length > 0) {
+      console.log('📊 first campaign:', {
+        id: campaigns[0].id,
+        status: campaigns[0].status,
+        sent: campaigns[0].sent,
+        owner_id: campaigns[0].owner_id,
+        created_at: campaigns[0].created_at
+      })
+    }
+    console.log('📊 END DEBUG ==================')
+    const campaignsWithScheduled = await Promise.all(campaigns.map(async (c) => {
+      const scheduled = await prisma.scheduled_campaigns.findUnique({
+        where: { campaign_id: c.id }
+      }).catch(() => null)
+      return { ...c, scheduled }
+    }))
+    const totalSent = campaigns.reduce((sum, c) => sum + (c.sent || 0), 0)
+    const totalFailed = campaigns.reduce((sum, c) => sum + (c.failed || 0), 0)
+    const totalMessages = totalSent + totalFailed
+    const deliveryRate = totalMessages > 0 ? Math.round((totalSent / totalMessages) * 100) : 0
+    const allLogs = await prisma.campaign_logs.findMany({
+      where: {
+        campaign_id: { in: campaigns.map(c => c.id) },
+        status: 'sent'
+      },
+      select: { contact_phone: true }
+    })
+    const uniqueDelivered = new Set(allLogs.map(l => l.contact_phone)).size
+    const campaignIds = campaigns.map(c => c.id)
+    const logsForMetrics = await prisma.campaign_logs.findMany({
+      where: { campaign_id: { in: campaignIds } }
+    })
+    const deliveredLogs = logsForMetrics.filter(l => l.delivered_at)
+    const readLogs = logsForMetrics.filter(l => l.read_at)
+    const repliedLogs = logsForMetrics.filter(l => l.has_reply)
+    const openRate = deliveredLogs.length > 0
+      ? Math.round((readLogs.length / deliveredLogs.length) * 1000) / 10
+      : 0
+    const repliesReceived = repliedLogs.length
+    const deliveryTimes = deliveredLogs
+      .map(l => new Date(l.delivered_at).getTime() - new Date(l.created_at).getTime())
+      .filter(t => t > 0)
+    const avgDeliveryTime = deliveryTimes.length > 0
+      ? Math.round((deliveryTimes.reduce((a, b) => a + b, 0) / deliveryTimes.length) / 1000)
+      : 0
+    let blacklistCount = 0
+    try {
+      blacklistCount = await prisma.blacklist?.count?.() || 0
+    } catch {
+      blacklistCount = 0
+    }
+    const scheduledCount = campaigns.filter(c => c.status === 'pending' && c.scheduled).length
+    const pendingCount = campaigns.filter(c => c.status === 'pending' && !c.scheduled).length
+    const dailyData = {}
+    campaigns.forEach(c => {
+      const date = c.created_at.toISOString().split('T')[0]
+      if (!dailyData[date]) dailyData[date] = { sent: 0, failed: 0 }
+      dailyData[date].sent += c.sent || 0
+      dailyData[date].failed += c.failed || 0
+    })
+    const chartData = Object.entries(dailyData)
+      .map(([date, data]) => ({
+        date,
+        sent: data.sent,
+        failed: data.failed,
+        total: data.sent + data.failed
+      }))
+      .sort((a, b) => a.date.localeCompare(b.date))
+        // Métricas base para todos
+    const baseStats = {
+      totalCampaigns: campaigns.length,
+      totalSent,
+      totalFailed,
+      totalMessages,
+      deliveryRate,
+      activeNow: campaigns.filter(c => c.status === 'running').length,
+      uniqueDelivered,
+    }
+
+    // Métricas avanzadas solo Pro/Business
+    const advancedStats = req.tier === 'starter' ? {
+      openRate: null,
+      repliesReceived: null,
+      blacklistCount: null,
+      avgDeliveryTime: null,
+      scheduledCount: null,
+      pendingCount: null,
+    } : {
+      openRate,
+      repliesReceived,
+      blacklistCount,
+      avgDeliveryTime,
+      scheduledCount,
+      pendingCount,
+    }
+
+    res.json({
+      campaigns: campaignsWithScheduled,
+      stats: { ...baseStats, ...advancedStats },
+      chartData
+    })
+  } catch (e) {
+    console.error('Error reportes:', e)
+    res.status(500).json({ error: 'Error generando reportes' })
+  }
+})
+
+app.post('/api/campaigns/simulate', authOrSecret, async (req, res) => {
+  try {
+    const { targets, line_ids, mode = 'lite' } = req.body
+    if (!targets?.length) return res.status(400).json({ error: 'Agregá números' })
+    if (!line_ids?.length) return res.status(400).json({ error: 'Seleccioná al menos una línea' })
+    let tier = req.user?.tier || 'starter'
+    if (!tier || tier === 'starter') {
+      const license = await prisma.app_config.findUnique({ where: { key: 'license' } })
+      if (license?.value) {
+        try {
+          const parsed = JSON.parse(license.value)
+          tier = parsed?.tier || 'starter'
+        } catch {
+          try {
+            const payload = JSON.parse(Buffer.from(license.value.split('.')[1], 'base64').toString())
+            tier = payload?.tier || 'starter'
+          } catch { tier = 'starter' }
+        }
+      }
+    }
+    if (tier === 'starter') return res.status(403).json({ error: 'Simulacro requiere Pro o Business' })
+    if (mode === 'full' && tier !== 'business') return res.status(403).json({ error: 'Simulacro Full requiere Business' })
+    if (mode === 'lite' && targets.length > 1 && tier !== 'business') {
+      return res.status(403).json({ error: 'Simulacro Lite: máximo 1 número en Pro' })
+    }
+    const campaign = await prisma.campaigns.create({
+      data: {
+        id: `sim_${Date.now()}`,
+        name: `Simulacro ${new Date().toLocaleString('es-AR')}`,
+        message: 'Modo simulacro: verificación de números',
+        total: targets.length,
+        sent: 0,
+        failed: 0,
+        status: 'simulated',
+        targets,
+        distribution_mode: line_ids.length > 1 ? 'round_robin' : 'single',
+        selected_lines: JSON.stringify(line_ids),
+        owner_id: req.user?.id || null
+      }
+    })
+    res.status(201).json({
+      success: true,
+      campaign: {
+        id: campaign.id,
+        name: campaign.name,
+        status: 'simulated',
+        total: targets.length,
+        mode
+      }
+    })
+  } catch (e) {
+    console.error('Error simulacro:', e)
+    res.status(500).json({ error: 'Error en simulacro' })
+  }
+})
+
+
+
+
 app.get('/api/campaigns/:id', authOrSecret, async (req, res) => {
   try {
     const userId = req.user?.id || null
@@ -1568,206 +1771,6 @@ app.get('/api/campaigns/:id/logs', authOrSecret, requireLicense, async (req, res
   } catch (e) {
     console.error('Logs error:', e)
     res.status(500).json({ error: 'Error obteniendo logs' })
-  }
-})
-
-app.post('/api/campaigns/simulate', authOrSecret, async (req, res) => {
-  try {
-    const { targets, line_ids, mode = 'lite' } = req.body
-    if (!targets?.length) return res.status(400).json({ error: 'Agregá números' })
-    if (!line_ids?.length) return res.status(400).json({ error: 'Seleccioná al menos una línea' })
-    let tier = req.user?.tier || 'starter'
-    if (!tier || tier === 'starter') {
-      const license = await prisma.app_config.findUnique({ where: { key: 'license' } })
-      if (license?.value) {
-        try {
-          const parsed = JSON.parse(license.value)
-          tier = parsed?.tier || 'starter'
-        } catch {
-          try {
-            const payload = JSON.parse(Buffer.from(license.value.split('.')[1], 'base64').toString())
-            tier = payload?.tier || 'starter'
-          } catch { tier = 'starter' }
-        }
-      }
-    }
-    if (tier === 'starter') return res.status(403).json({ error: 'Simulacro requiere Pro o Business' })
-    if (mode === 'full' && tier !== 'business') return res.status(403).json({ error: 'Simulacro Full requiere Business' })
-    if (mode === 'lite' && targets.length > 1 && tier !== 'business') {
-      return res.status(403).json({ error: 'Simulacro Lite: máximo 1 número en Pro' })
-    }
-    const campaign = await prisma.campaigns.create({
-      data: {
-        id: `sim_${Date.now()}`,
-        name: `Simulacro ${new Date().toLocaleString('es-AR')}`,
-        message: 'Modo simulacro: verificación de números',
-        total: targets.length,
-        sent: 0,
-        failed: 0,
-        status: 'simulated',
-        targets,
-        distribution_mode: line_ids.length > 1 ? 'round_robin' : 'single',
-        selected_lines: JSON.stringify(line_ids),
-        owner_id: req.user?.id || null
-      }
-    })
-    res.status(201).json({
-      success: true,
-      campaign: {
-        id: campaign.id,
-        name: campaign.name,
-        status: 'simulated',
-        total: targets.length,
-        mode
-      }
-    })
-  } catch (e) {
-    console.error('Error simulacro:', e)
-    res.status(500).json({ error: 'Error en simulacro' })
-  }
-})
-
-app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
-  try {
-    const { period } = req.query
-        console.log('📊 REPORT DEBUG ==================')
-    console.log('📊 tier:', req.tier)
-    console.log('📊 userId:', req.user?.id || 'null/undefined')
-    console.log('📊 period param:', period)
-    let dateFilter = {}
-    if (req.tier === 'starter') {
-    console.log('📊 Applying STARTER filter: 30d')
-      dateFilter = { created_at: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } }
-    } else {
-    console.log('📊 Applying PRO/BUSINESS filter for period:', period)
-      if (period === '7d') {
-        dateFilter = { created_at: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } }
-      } else if (period === '30d') {
-        dateFilter = { created_at: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } }
-      } else if (period === '90d') {
-        dateFilter = { created_at: { gte: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) } }
-      } else if (period === 'all') {
-        dateFilter = {}
-      } else {
-        dateFilter = { created_at: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } }
-      }
-    }
-    const userId = req.user?.id || null
-    console.log('📊 dateFilter:', JSON.stringify(dateFilter))
-    console.log('📊 userId for where:', userId)
-    const campaigns = await prisma.campaigns.findMany({
-      where: {
-        ...dateFilter,
-        ...(userId ? { OR: [{ owner_id: userId }, { owner_id: null }] } : {})
-      },
-      orderBy: { created_at: 'desc' }
-    })
-
-    console.log('📊 campaigns found:', campaigns.length)
-    if (campaigns.length > 0) {
-      console.log('📊 first campaign:', {
-        id: campaigns[0].id,
-        status: campaigns[0].status,
-        sent: campaigns[0].sent,
-        owner_id: campaigns[0].owner_id,
-        created_at: campaigns[0].created_at
-      })
-    }
-    console.log('📊 END DEBUG ==================')
-    const campaignsWithScheduled = await Promise.all(campaigns.map(async (c) => {
-      const scheduled = await prisma.scheduled_campaigns.findUnique({
-        where: { campaign_id: c.id }
-      }).catch(() => null)
-      return { ...c, scheduled }
-    }))
-    const totalSent = campaigns.reduce((sum, c) => sum + (c.sent || 0), 0)
-    const totalFailed = campaigns.reduce((sum, c) => sum + (c.failed || 0), 0)
-    const totalMessages = totalSent + totalFailed
-    const deliveryRate = totalMessages > 0 ? Math.round((totalSent / totalMessages) * 100) : 0
-    const allLogs = await prisma.campaign_logs.findMany({
-      where: {
-        campaign_id: { in: campaigns.map(c => c.id) },
-        status: 'sent'
-      },
-      select: { contact_phone: true }
-    })
-    const uniqueDelivered = new Set(allLogs.map(l => l.contact_phone)).size
-    const campaignIds = campaigns.map(c => c.id)
-    const logsForMetrics = await prisma.campaign_logs.findMany({
-      where: { campaign_id: { in: campaignIds } }
-    })
-    const deliveredLogs = logsForMetrics.filter(l => l.delivered_at)
-    const readLogs = logsForMetrics.filter(l => l.read_at)
-    const repliedLogs = logsForMetrics.filter(l => l.has_reply)
-    const openRate = deliveredLogs.length > 0
-      ? Math.round((readLogs.length / deliveredLogs.length) * 1000) / 10
-      : 0
-    const repliesReceived = repliedLogs.length
-    const deliveryTimes = deliveredLogs
-      .map(l => new Date(l.delivered_at).getTime() - new Date(l.created_at).getTime())
-      .filter(t => t > 0)
-    const avgDeliveryTime = deliveryTimes.length > 0
-      ? Math.round((deliveryTimes.reduce((a, b) => a + b, 0) / deliveryTimes.length) / 1000)
-      : 0
-    let blacklistCount = 0
-    try {
-      blacklistCount = await prisma.blacklist?.count?.() || 0
-    } catch {
-      blacklistCount = 0
-    }
-    const scheduledCount = campaigns.filter(c => c.status === 'pending' && c.scheduled).length
-    const pendingCount = campaigns.filter(c => c.status === 'pending' && !c.scheduled).length
-    const dailyData = {}
-    campaigns.forEach(c => {
-      const date = c.created_at.toISOString().split('T')[0]
-      if (!dailyData[date]) dailyData[date] = { sent: 0, failed: 0 }
-      dailyData[date].sent += c.sent || 0
-      dailyData[date].failed += c.failed || 0
-    })
-    const chartData = Object.entries(dailyData)
-      .map(([date, data]) => ({
-        date,
-        sent: data.sent,
-        failed: data.failed,
-        total: data.sent + data.failed
-      }))
-      .sort((a, b) => a.date.localeCompare(b.date))
-        // Métricas base para todos
-    const baseStats = {
-      totalCampaigns: campaigns.length,
-      totalSent,
-      totalFailed,
-      totalMessages,
-      deliveryRate,
-      activeNow: campaigns.filter(c => c.status === 'running').length,
-      uniqueDelivered,
-    }
-
-    // Métricas avanzadas solo Pro/Business
-    const advancedStats = req.tier === 'starter' ? {
-      openRate: null,
-      repliesReceived: null,
-      blacklistCount: null,
-      avgDeliveryTime: null,
-      scheduledCount: null,
-      pendingCount: null,
-    } : {
-      openRate,
-      repliesReceived,
-      blacklistCount,
-      avgDeliveryTime,
-      scheduledCount,
-      pendingCount,
-    }
-
-    res.json({
-      campaigns: campaignsWithScheduled,
-      stats: { ...baseStats, ...advancedStats },
-      chartData
-    })
-  } catch (e) {
-    console.error('Error reportes:', e)
-    res.status(500).json({ error: 'Error generando reportes' })
   }
 })
 
