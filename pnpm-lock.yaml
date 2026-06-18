@@ -23,9 +23,15 @@ dependencies:
   express:
     specifier: ^4.18.2
     version: 4.22.2
+  express-rate-limit:
+    specifier: ^8.5.2
+    version: 8.5.2(express@4.22.2)
   fs-extra:
     specifier: ^11.2.0
     version: 11.3.5
+  helmet:
+    specifier: ^8.2.0
+    version: 8.2.0
   jsonwebtoken:
     specifier: ^9.0.3
     version: 9.0.3
@@ -850,6 +856,16 @@ packages:
     engines: {node: '>=0.8.x'}
     dev: false
 
+  /express-rate-limit@8.5.2(express@4.22.2):
+    resolution: {integrity: sha512-5Kb34ipNX694DH48vN9irak1Qx30nb0PLYHXfJgw4YEjiC3ZEmZJhwOp+VfiCYwFzvFTdB9QkArYS5kXa2cx2A==}
+    engines: {node: '>= 16'}
+    peerDependencies:
+      express: '>= 4.11'
+    dependencies:
+      express: 4.22.2
+      ip-address: 10.2.0
+    dev: false
+
   /express@4.22.2:
     resolution: {integrity: sha512-IuL+Elrou2ZvCFHs18/CIzy2Nzvo25nZ1/D2eIZlz7c+QUayAcYoiM2BthCjs+EBHVpjYjcuLDAiCWgeIX3X1Q==}
     engines: {node: '>= 0.10.0'}
@@ -1016,6 +1032,11 @@ packages:
       function-bind: 1.1.2
     dev: false
 
+  /helmet@8.2.0:
+    resolution: {integrity: sha512-DRgTIUgnWcJ62KyarxxziuqYxKGnR6Rgg19BlbucN/dpmJbl1XOit6qvoOX0ZT+HhWe5OUVhU/a1zpGyc1xA0Q==}
+    engines: {node: '>=18.0.0'}
+    dev: false
+
   /hookified@1.15.1:
     resolution: {integrity: sha512-MvG/clsADq1GPM2KGo2nyfaWVyn9naPiXrqIe4jYjXNZQt238kWyOGrsyc/DmRAQ+Re6yeo6yX/yoNCG5KAEVg==}
     dev: false
@@ -1048,6 +1069,11 @@ packages:
 
   /inherits@2.0.4:
     resolution: {integrity: sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==}
+    dev: false
+
+  /ip-address@10.2.0:
+    resolution: {integrity: sha512-/+S6j4E9AHvW9SWMSEY9Xfy66O5PWvVEJ08O0y5JGyEKQpojb0K0GKpz/v5HJ/G0vi3D2sjGK78119oXZeE0qA==}
+    engines: {node: '>= 12'}
     dev: false
 
   /ipaddr.js@1.9.1:
