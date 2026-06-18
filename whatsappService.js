@@ -81,7 +81,6 @@ class WAService {
       const ownerId = line.owner_id || null
       this.lineOwners.set(lineId, ownerId) // ← cachear owner
       const sessionPath = path.join(this.sessionsDir, String(lineId))
-      const sessionPath = path.join(this.sessionsDir, String(lineId))
       const existing = this.clients.get(lineId)
       if (existing) {
         try { existing.ws?.close() } catch {}
