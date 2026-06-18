@@ -1630,10 +1630,14 @@ app.post('/api/campaigns/simulate', authOrSecret, async (req, res) => {
 app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
   try {
     const { period } = req.query
+    
     let dateFilter = {}
+    
+    // Starter: siempre 30 días, ignora el query param
     if (req.tier === 'starter') {
       dateFilter = { created_at: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } }
     } else {
+      // Pro y Business: respetan el period
       if (period === '7d') {
         dateFilter = { created_at: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } }
       } else if (period === '30d') {
@@ -1646,24 +1650,30 @@ app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
         dateFilter = { created_at: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } }
       }
     }
-    const userId = req.user?.id || null
+    
+   
+    
+    
     const campaigns = await prisma.campaigns.findMany({
-      where: {
-        ...dateFilter,
-        ...(userId ? { OR: [{ owner_id: userId }, { owner_id: null }] } : {})
-      },
+      where: dateFilter,
       orderBy: { created_at: 'desc' }
     })
+    
+    // Enriquecer con datos de programación
     const campaignsWithScheduled = await Promise.all(campaigns.map(async (c) => {
       const scheduled = await prisma.scheduled_campaigns.findUnique({
         where: { campaign_id: c.id }
       }).catch(() => null)
       return { ...c, scheduled }
     }))
+    
+    // Stats agregadas
     const totalSent = campaigns.reduce((sum, c) => sum + (c.sent || 0), 0)
     const totalFailed = campaigns.reduce((sum, c) => sum + (c.failed || 0), 0)
     const totalMessages = totalSent + totalFailed
     const deliveryRate = totalMessages > 0 ? Math.round((totalSent / totalMessages) * 100) : 0
+
+    // Contactos únicos alcanzados (desde logs, no duplicados)
     const allLogs = await prisma.campaign_logs.findMany({
       where: {
         campaign_id: { in: campaigns.map(c => c.id) },
@@ -1672,31 +1682,50 @@ app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
       select: { contact_phone: true }
     })
     const uniqueDelivered = new Set(allLogs.map(l => l.contact_phone)).size
+    
+    // ========== NUEVO: MÉTRICAS AVANZADAS ==========
     const campaignIds = campaigns.map(c => c.id)
+    
+    // Traer todos los logs de estas campañas (con los nuevos campos)
     const logsForMetrics = await prisma.campaign_logs.findMany({
       where: { campaign_id: { in: campaignIds } }
     })
+    
     const deliveredLogs = logsForMetrics.filter(l => l.delivered_at)
     const readLogs = logsForMetrics.filter(l => l.read_at)
     const repliedLogs = logsForMetrics.filter(l => l.has_reply)
-    const openRate = deliveredLogs.length > 0
-      ? Math.round((readLogs.length / deliveredLogs.length) * 1000) / 10
+    
+    // Tasa de apertura: read / delivered
+    const openRate = deliveredLogs.length > 0 
+      ? Math.round((readLogs.length / deliveredLogs.length) * 1000) / 10 
       : 0
+    
+    // Respuestas recibidas
     const repliesReceived = repliedLogs.length
+    
+    // Tiempo promedio de entrega (ms → segundos)
     const deliveryTimes = deliveredLogs
       .map(l => new Date(l.delivered_at).getTime() - new Date(l.created_at).getTime())
       .filter(t => t > 0)
+    
     const avgDeliveryTime = deliveryTimes.length > 0
       ? Math.round((deliveryTimes.reduce((a, b) => a + b, 0) / deliveryTimes.length) / 1000)
       : 0
+    
+    // Blacklist (si tenés tabla, reemplazar; si no, queda en 0)
     let blacklistCount = 0
     try {
       blacklistCount = await prisma.blacklist?.count?.() || 0
     } catch {
       blacklistCount = 0
     }
+    
+    // Campañas programadas vs pendientes
     const scheduledCount = campaigns.filter(c => c.status === 'pending' && c.scheduled).length
     const pendingCount = campaigns.filter(c => c.status === 'pending' && !c.scheduled).length
+    // ================================================
+    
+    // Datos para gráfico por día
     const dailyData = {}
     campaigns.forEach(c => {
       const date = c.created_at.toISOString().split('T')[0]
@@ -1704,6 +1733,7 @@ app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
       dailyData[date].sent += c.sent || 0
       dailyData[date].failed += c.failed || 0
     })
+    
     const chartData = Object.entries(dailyData)
       .map(([date, data]) => ({
         date,
@@ -1712,39 +1742,28 @@ app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
         total: data.sent + data.failed
       }))
       .sort((a, b) => a.date.localeCompare(b.date))
-        // Métricas base para todos
-    const baseStats = {
-      totalCampaigns: campaigns.length,
-      totalSent,
-      totalFailed,
-      totalMessages,
-      deliveryRate,
-      activeNow: campaigns.filter(c => c.status === 'running').length,
-      uniqueDelivered,
-    }
-
-    // Métricas avanzadas solo Pro/Business
-    const advancedStats = req.tier === 'starter' ? {
-      openRate: null,
-      repliesReceived: null,
-      blacklistCount: null,
-      avgDeliveryTime: null,
-      scheduledCount: null,
-      pendingCount: null,
-    } : {
-      openRate,
-      repliesReceived,
-      blacklistCount,
-      avgDeliveryTime,
-      scheduledCount,
-      pendingCount,
-    }
-
+    
     res.json({
       campaigns: campaignsWithScheduled,
-      stats: { ...baseStats, ...advancedStats },
+      stats: {
+        totalCampaigns: campaigns.length,
+        totalSent,
+        totalFailed,
+        totalMessages,
+        deliveryRate,
+        activeNow: campaigns.filter(c => c.status === 'running').length,
+        uniqueDelivered,
+        // NUEVAS MÉTRICAS
+        openRate,
+        repliesReceived,
+        blacklistCount,
+        avgDeliveryTime,
+        scheduledCount,
+        pendingCount,
+      },
       chartData
     })
+    
   } catch (e) {
     console.error('Error reportes:', e)
     res.status(500).json({ error: 'Error generando reportes' })
