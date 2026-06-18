@@ -857,6 +857,7 @@ app.get('/api/templates', authOrSecret, async (req, res) => {
 app.post('/api/templates', authOrSecret, loadTier, async (req, res) => {
   const { name, content, category, imageUrl } = req.body
   if (!name || !content) return res.status(400).json({ error: 'Nombre y contenido requeridos' })
+  
   const userId = req.user?.id || null
   const currentTemplates = await prisma.message_templates.count({
     where: userId ? { OR: [{ owner_id: userId }, { owner_id: null }] } : {}
@@ -869,8 +870,13 @@ app.post('/api/templates', authOrSecret, loadTier, async (req, res) => {
       tier: req.tier,
     })
   }
+  
   const variables = [...content.matchAll(/\{\{(\w+)\}\}/g)].map(m => m[1])
   const uniqueVars = [...new Set(variables)]
+  
+
+  const allowedImageUrl = req.tierConfig?.hasTemplateVars ? imageUrl : null
+  
   try {
     const template = await prisma.message_templates.create({
       data: {
@@ -878,7 +884,7 @@ app.post('/api/templates', authOrSecret, loadTier, async (req, res) => {
         content,
         category: category || 'General',
         variables: uniqueVars,
-        imageUrl: imageUrl || null,
+        imageUrl: allowedImageUrl || null,
         owner_id: req.user?.id || null
       }
     })
@@ -888,18 +894,24 @@ app.post('/api/templates', authOrSecret, loadTier, async (req, res) => {
   }
 })
 
-app.patch('/api/templates/:id', authOrSecret, async (req, res) => {
+app.patch('/api/templates/:id', authOrSecret, loadTier, async (req, res) => {
   const { id } = req.params
   const { name, content, category, imageUrl } = req.body
+  
   const variables = content ? [...content.matchAll(/\{\{(\w+)\}\}/g)].map(m => m[1]) : undefined
   const uniqueVars = variables ? [...new Set(variables)] : undefined
+  
+ 
+  const allowedImageUrl = req.tierConfig?.hasTemplateVars ? imageUrl : undefined
+  
   try {
     const updateData = {}
     if (name !== undefined) updateData.name = name
     if (content !== undefined) updateData.content = content
     if (category !== undefined) updateData.category = category
     if (uniqueVars !== undefined) updateData.variables = uniqueVars
-    if (imageUrl !== undefined) updateData.imageUrl = imageUrl || null
+    if (allowedImageUrl !== undefined) updateData.imageUrl = allowedImageUrl || null
+    
     const template = await prisma.message_templates.update({
       where: { id },
       data: updateData
@@ -953,7 +965,7 @@ app.post('/api/templates/:id/use', authOrSecret, async (req, res) => {
   }
 })
 
-app.patch('/api/templates/:id/favorite', loadTier, requireFeature('hasTemplateFavorite'), authOrSecret, async (req, res) => {
+app.patch('/api/templates/:id/favorite', authOrSecret, loadTier, requireFeature('hasTemplateVars'), async (req, res) => {
   try {
     const { id } = req.params
     const template = await prisma.message_templates.findUnique({
@@ -1134,7 +1146,7 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
         tier: req.tier,
       })
     }
-
+    const allowedImageUrl = req.tierConfig?.hasTemplateVars ? body.image_url : null
     const newCampaign = await prisma.campaigns.create({
       data: {
         id: `camp_${Date.now()}`,
@@ -1143,6 +1155,7 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
         image_url: body.image_url || null,
         total: body.targets.length,
         sent: 0,
+        image_url: allowedImageUrl || null,
         failed: 0,
         status: 'pending',
         targets: body.targets,
@@ -1698,23 +1711,37 @@ app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
         total: data.sent + data.failed
       }))
       .sort((a, b) => a.date.localeCompare(b.date))
+        // Métricas base para todos
+    const baseStats = {
+      totalCampaigns: campaigns.length,
+      totalSent,
+      totalFailed,
+      totalMessages,
+      deliveryRate,
+      activeNow: campaigns.filter(c => c.status === 'running').length,
+      uniqueDelivered,
+    }
+
+    // Métricas avanzadas solo Pro/Business
+    const advancedStats = req.tier === 'starter' ? {
+      openRate: null,
+      repliesReceived: null,
+      blacklistCount: null,
+      avgDeliveryTime: null,
+      scheduledCount: null,
+      pendingCount: null,
+    } : {
+      openRate,
+      repliesReceived,
+      blacklistCount,
+      avgDeliveryTime,
+      scheduledCount,
+      pendingCount,
+    }
+
     res.json({
       campaigns: campaignsWithScheduled,
-      stats: {
-        totalCampaigns: campaigns.length,
-        totalSent,
-        totalFailed,
-        totalMessages,
-        deliveryRate,
-        activeNow: campaigns.filter(c => c.status === 'running').length,
-        uniqueDelivered,
-        openRate,
-        repliesReceived,
-        blacklistCount,
-        avgDeliveryTime,
-        scheduledCount,
-        pendingCount,
-      },
+      stats: { ...baseStats, ...advancedStats },
       chartData
     })
   } catch (e) {
