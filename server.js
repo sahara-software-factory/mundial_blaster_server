@@ -20,6 +20,7 @@ let JWT_SECRET = process.env.JWT_SECRET
 
 const prisma = new PrismaClient()
 const app = express()
+app.set('trust proxy', 1)
 const server = http.createServer(app)
 
 // CORS
