@@ -71,52 +71,63 @@ class WAService {
   }
 
   async connect(phone) {
-    try {
-      let line = await this.prisma.lineas_whatsapp.findUnique({ where: { phone } })
-      if (!line) {
-        console.warn(`⚠️ Línea no registrada: ${maskPhone(phone)}`)
-        return
-      }
-      const lineId = line.id
-      const ownerId = line.owner_id || null
-      this.lineOwners.set(lineId, ownerId) // ← cachear owner
-      const sessionPath = path.join(this.sessionsDir, String(lineId))
-      const existing = this.clients.get(lineId)
-      if (existing) {
-        try { existing.ws?.close() } catch {}
-        this.clients.delete(lineId)
-      }
-      await fs.ensureDir(sessionPath)
-      const { state, saveCreds } = await useMultiFileAuthState(sessionPath)
-      const { version } = await fetchLatestBaileysVersion()
-      const waClient = makeWASocket({
-        version,
-        logger,
-        printQRInTerminal: false,
-        auth: {
-          creds: state.creds,
-          keys: makeCacheableSignalKeyStore(state.keys, logger),
-        },
-        browser: ['WabiSend', 'Chrome', '120.0.0'],
-        msgRetryCounterCache: this.msgRetryCounterCache,
-        getMessage: async (key) => {
-          return { conversation: 'WabiSend' }
-        },
-        markOnlineOnConnect: false,
-        syncFullHistory: false,
-        connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 25000,
-        retryRequestDelayMs: 3000,
-        defaultQueryTimeoutMs: 60000,
-      })
-      this.clients.set(lineId, waClient)
-      this.setupEvents(waClient, lineId, phone, saveCreds)
-      return line
-    } catch (err) {
-      console.error('❌ Error connect:', err)
-      throw err
+  // 🔐 INLINE LICENSE CHECK
+  const licenseConfig = await this.prisma.app_config.findUnique({ where: { key: 'license' } })
+  if (!licenseConfig?.value) throw new Error('LICENSE_REQUIRED')
+  const license = validateLicense(licenseConfig.value)  // ← SIN this.
+  if (!license) throw new Error('LICENSE_INVALID')
+  
+  // Verificar límite de líneas según tier
+  const tierConfig = TIER_LIMITS[license.tier]  // ← TIER_LIMITS global del server.js
+  const activeLines = await this.prisma.lineas_whatsapp.count({ where: { status: 'CONECTADA' } })
+  if (activeLines >= tierConfig.maxLines) throw new Error('TIER_LINE_LIMIT')
+  
+  try {
+    let line = await this.prisma.lineas_whatsapp.findUnique({ where: { phone } })
+    if (!line) {
+      console.warn(`⚠️ Línea no registrada: ${maskPhone(phone)}`)
+      return
     }
+    const lineId = line.id
+    const ownerId = line.owner_id || null
+    this.lineOwners.set(lineId, ownerId)
+    const sessionPath = path.join(this.sessionsDir, String(lineId))
+    const existing = this.clients.get(lineId)
+    if (existing) {
+      try { existing.ws?.close() } catch {}
+      this.clients.delete(lineId)
+    }
+    await fs.ensureDir(sessionPath)
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath)
+    const { version } = await fetchLatestBaileysVersion()
+    const waClient = makeWASocket({
+      version,
+      logger,
+      printQRInTerminal: false,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      browser: ['WabiSend', 'Chrome', '120.0.0'],
+      msgRetryCounterCache: this.msgRetryCounterCache,
+      getMessage: async (key) => {
+        return { conversation: 'WabiSend' }
+      },
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000,
+      retryRequestDelayMs: 3000,
+      defaultQueryTimeoutMs: 60000,
+    })
+    this.clients.set(lineId, waClient)
+    this.setupEvents(waClient, lineId, phone, saveCreds)
+    return line
+  } catch (err) {
+    console.error('❌ Error connect:', err)
+    throw err
   }
+}
 
   setupEvents(waClient, lineId, phone, saveCreds) {
     waClient.ev.on('creds.update', saveCreds)
@@ -592,96 +603,168 @@ class WAService {
   }
 
   async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
-    const { delayMin = 8000, delayMax = 15000, imageUrl = null } = options
-    let lineasActivas = []
-    if (Array.isArray(lineInput)) {
-      lineasActivas = lineInput.filter(l => l.status === 'CONECTADA' && this.clients.has(l.id))
-    } else if (typeof lineInput === 'string') {
-      const line = await this.prisma.lineas_whatsapp.findUnique({ where: { id: lineInput } })
-      if (line && line.status === 'CONECTADA') lineasActivas = [line]
-    } else if (lineInput && lineInput.id) {
-      lineasActivas = [lineInput]
-    }
-    if (lineasActivas.length === 0) {
-      throw new Error('No hay líneas conectadas disponibles para enviar')
-    }
-    await this.prisma.campaigns.update({
-      where: { id: campaignId },
-      data: { status: 'running' }
-    }).catch(() => {})
-    const results = []
-    let wasCancelled = false
-    let lineaIndex = 0
-    const lineasCaidas = new Set()
-    let lastDelayMs = 0
+  // 🔐 INLINE LICENSE CHECK
+  const licenseConfig = await this.prisma.app_config.findUnique({ where: { key: 'license' } })
+  if (!licenseConfig?.value) throw new Error('LICENSE_REQUIRED')
+  const license = validateLicense(licenseConfig.value)  // ← SIN this.
+  if (!license) throw new Error('LICENSE_INVALID')
+  
+  // Verificar tier para features avanzadas
+  if (options.humanMode && license.tier === 'starter') throw new Error('TIER_UPGRADE_REQUIRED')
+  if (options.imageUrl && license.tier === 'starter') throw new Error('TIER_UPGRADE_REQUIRED')
+  
+  const { delayMin = 8000, delayMax = 15000, imageUrl = null } = options
+  let lineasActivas = []
+  if (Array.isArray(lineInput)) {
+    lineasActivas = lineInput.filter(l => l.status === 'CONECTADA' && this.clients.has(l.id))
+  } else if (typeof lineInput === 'string') {
+    const line = await this.prisma.lineas_whatsapp.findUnique({ where: { id: lineInput } })
+    if (line && line.status === 'CONECTADA') lineasActivas = [line]
+  } else if (lineInput && lineInput.id) {
+    lineasActivas = [lineInput]
+  }
+  if (lineasActivas.length === 0) {
+    throw new Error('No hay líneas conectadas disponibles para enviar')
+  }
+  
+  await this.prisma.campaigns.update({
+    where: { id: campaignId },
+    data: { status: 'running' }
+  }).catch(() => {})
+  
+  const results = []
+  let wasCancelled = false
+  let lineaIndex = 0
+  const lineasCaidas = new Set()
+  let lastDelayMs = 0
 
-    for (let i = 0; i < targets.length; i++) {
-      const target = targets[i]
+  for (let i = 0; i < targets.length; i++) {
+    const target = targets[i]
 
-      if (!target || !target.phone || typeof target.phone !== 'string') {
-        console.warn(`⚠️ Target inválido en índice ${i}, saltando`)
+    if (!target || !target.phone || typeof target.phone !== 'string') {
+      console.warn(`⚠️ Target inválido en índice ${i}, saltando`)
+      continue
+    }
+
+    if (options.skipBlacklist) {
+      const cleanPhone = target.phone.replace(/\D/g, '')
+      const blacklisted = await this.prisma.blacklist.findFirst({
+        where: { phone: cleanPhone }
+      })
+      if (blacklisted) {
+        console.log(`⛔ Saltando ${maskPhone(target.phone)} — blacklist`)
+        await this.prisma.campaign_logs.create({
+          data: {
+            campaign_id: campaignId,
+            contact_phone: target.phone,
+            status: 'skipped_blacklist',
+            line_id: null,
+            owner_id: options.ownerId || null,
+          }
+        }).catch(() => {})
         continue
       }
+    }
 
-      if (options.skipBlacklist) {
-        const cleanPhone = target.phone.replace(/\D/g, '')
-        const blacklisted = await this.prisma.blacklist.findFirst({
-          where: { phone: cleanPhone }
-        })
-        if (blacklisted) {
-          console.log(`⛔ Saltando ${maskPhone(target.phone)} — blacklist`)
-          await this.prisma.campaign_logs.create({
-            data: {
-              campaign_id: campaignId,
-              contact_phone: target.phone,
-              status: 'skipped_blacklist',
-              line_id: null,
-              owner_id: options.ownerId || null,
-            }
-          }).catch(() => {})
-          continue
+    try {
+      const campaignStatus = await this.prisma.campaigns.findUnique({
+        where: { id: campaignId },
+        select: { status: true }
+      })
+      if (campaignStatus?.status === 'cancelled') {
+        console.log(`⏹️ Campaña ${campaignId} cancelada. Deteniendo en ${i}/${targets.length}`)
+        wasCancelled = true
+        break
+      }
+    } catch (e) {}
+
+    let intentos = 0
+    let lineaAsignada = null
+    while (intentos < lineasActivas.length) {
+      const candidata = lineasActivas[lineaIndex % lineasActivas.length]
+      if (!lineasCaidas.has(candidata.id)) {
+        lineaAsignada = candidata
+        break
+      }
+      lineaIndex++
+      intentos++
+    }
+
+    if (!lineaAsignada) {
+      const quedanLineasGlobales = lineasActivas.some(l => !lineasCaidas.has(l.id))
+      if (!quedanLineasGlobales) {
+        console.log(`🛑 TODAS LAS LÍNEAS CAÍDAS. Deteniendo campaña ${campaignId} en ${i}/${targets.length}`)
+        await this.prisma.campaign_logs.create({
+          data: {
+            campaign_id: campaignId,
+            line_id: null,
+            contact_phone: target.phone,
+            status: 'failed',
+            error: 'Todas las líneas offline - Campaña detenida por desconexión total',
+            owner_id: options.ownerId || null,
+          }
+        }).catch(() => {})
+        wasCancelled = true
+        break
+      }
+      results.push({ phone: target.phone, status: 'failed', error: 'Todas las líneas offline', index: i })
+      await this.prisma.campaign_logs.create({
+        data: {
+          campaign_id: campaignId,
+          line_id: null,
+          contact_phone: target.phone,
+          status: 'failed',
+          error: 'Todas las líneas offline',
+          owner_id: options.ownerId || null,
         }
+      }).catch(() => {})
+      continue
+    }
+
+    const waClientCheck = this.clients.get(lineaAsignada.id)
+    if (!waClientCheck || !waClientCheck.user) {
+      lineasCaidas.add(lineaAsignada.id)
+      i--
+      continue
+    }
+
+    try {
+      const resolvedMessage = resolveSpintax(message)
+      const personalized = resolvedMessage
+        .replace(/\{\{nombre\}\}/gi, target.name || 'Cliente')
+        .replace(/\{nombre\}/gi, target.name || 'Cliente')
+        .replace(/\{\{telefono\}\}/gi, target.phone || '')
+        .replace(/\{telefono\}/gi, target.phone || '')
+
+      const sendOptions = { type: imageUrl ? 'image' : 'text', imageUrl }
+      let sendResult
+      if (options.humanMode) {
+        sendResult = await this.sendMessageHuman(lineaAsignada.id, target.phone, personalized, sendOptions)
+      } else {
+        sendResult = await this.sendMessage(lineaAsignada.id, target.phone, personalized, sendOptions)
       }
 
-      try {
-        const campaignStatus = await this.prisma.campaigns.findUnique({
-          where: { id: campaignId },
-          select: { status: true }
-        })
-        if (campaignStatus?.status === 'cancelled') {
-          console.log(`⏹️ Campaña ${campaignId} cancelada. Deteniendo en ${i}/${targets.length}`)
-          wasCancelled = true
-          break
-        }
-      } catch (e) {}
+      const exactMessageId = sendResult?.messageId
 
-      let intentos = 0
-      let lineaAsignada = null
-      while (intentos < lineasActivas.length) {
-        const candidata = lineasActivas[lineaIndex % lineasActivas.length]
-        if (!lineasCaidas.has(candidata.id)) {
-          lineaAsignada = candidata
-          break
+      await this.prisma.campaign_logs.create({
+        data: {
+          campaign_id: campaignId,
+          line_id: lineaAsignada.id,
+          contact_phone: target.phone,
+          status: 'sent',
+          message_id: exactMessageId,
+          owner_id: options.ownerId || null,
         }
-        lineaIndex++
-        intentos++
-      }
+      }).catch(() => {})
 
-      if (!lineaAsignada) {
-        const quedanLineasGlobales = lineasActivas.some(l => !lineasCaidas.has(l.id))
-        if (!quedanLineasGlobales) {
-          console.log(`🛑 TODAS LAS LÍNEAS CAÍDAS. Deteniendo campaña ${campaignId} en ${i}/${targets.length}`)
-          await this.prisma.campaign_logs.create({
-            data: {
-              campaign_id: campaignId,
-              line_id: null,
-              contact_phone: target.phone,
-              status: 'failed',
-              error: 'Todas las líneas offline - Campaña detenida por desconexión total',
-              owner_id: options.ownerId || null,
-            }
-          }).catch(() => {})
-                const ownerId = options.ownerId || null
+      await this.prisma.campaigns.update({
+        where: { id: campaignId },
+        data: { sent: { increment: 1 } }
+      }).catch(e => console.error(`[DB] Error incrementando sent:`, e.message))
+
+      results.push({ phone: target.phone, status: 'sent', lineId: lineaAsignada.id, index: i })
+
+      const ownerId = options.ownerId || null
       const payload = {
         campaignId: campaignId,
         campaign_id: campaignId,
@@ -700,197 +783,134 @@ class WAService {
       } else {
         this.io.emit('campaign_log', payload)
       }
-          wasCancelled = true
-          break
-        }
-        results.push({ phone: target.phone, status: 'failed', error: 'Todas las líneas offline', index: i })
-        await this.prisma.campaign_logs.create({
-          data: {
-            campaign_id: campaignId,
-            line_id: null,
-            contact_phone: target.phone,
-            status: 'failed',
-            error: 'Todas las líneas offline',
-            owner_id: options.ownerId || null,
-          }
-        }).catch(() => {})
-        continue
+
+      console.log(`✅ ${i + 1}/${targets.length} → ${maskPhone(target.phone)} [${maskPhone(lineaAsignada.phone)}]`)
+      lineaIndex++
+
+    } catch (err) {
+      console.error(`❌ ${maskPhone(target.phone)} [${maskPhone(lineaAsignada.phone)}]:`, err.message)
+      lineasCaidas.add(lineaAsignada.id)
+
+      await this.prisma.campaigns.update({
+        where: { id: campaignId },
+        data: { failed: { increment: 1 } }
+      }).catch(() => {})
+
+      const failPayload = {
+        campaignId: campaignId,
+        campaign_id: campaignId,
+        phone: target.phone,
+        contact_phone: target.phone,
+        status: 'failed',
+        lineId: lineaAsignada.id,
+        delayMs: lastDelayMs,
+        line_id: lineaAsignada.id,
+        linePhone: lineaAsignada.phone,
+        line_phone: lineaAsignada.phone,
+        error: err.message?.slice(0, 200),
+        progress: `${i + 1}/${targets.length}`
+      }
+      if (options.ownerId && this.io.emitToUser) {
+        this.io.emitToUser(options.ownerId, 'campaign_log', failPayload)
+      } else {
+        this.io.emit('campaign_log', failPayload)
       }
 
-      const waClientCheck = this.clients.get(lineaAsignada.id)
-      if (!waClientCheck || !waClientCheck.user) {
-        lineasCaidas.add(lineaAsignada.id)
+      await this.prisma.campaign_logs.create({
+        data: {
+          campaign_id: campaignId,
+          line_id: lineaAsignada.id,
+          contact_phone: target.phone,
+          status: 'failed',
+          error: err.message?.slice(0, 200),
+          owner_id: options.ownerId || null,
+        }
+      }).catch(() => {})
+
+      const quedanLineas = lineasActivas.some(l => !lineasCaidas.has(l.id))
+      if (quedanLineas) {
         i--
-        continue
-      }
-
-      try {
-        const resolvedMessage = resolveSpintax(message)
-        const personalized = resolvedMessage
-          .replace(/\{\{nombre\}\}/gi, target.name || 'Cliente')
-          .replace(/\{nombre\}/gi, target.name || 'Cliente')
-          .replace(/\{\{telefono\}\}/gi, target.phone || '')
-          .replace(/\{telefono\}/gi, target.phone || '')
-
-        const sendOptions = { type: imageUrl ? 'image' : 'text', imageUrl }
-        let sendResult
-        if (options.humanMode) {
-          sendResult = await this.sendMessageHuman(lineaAsignada.id, target.phone, personalized, sendOptions)
-        } else {
-          sendResult = await this.sendMessage(lineaAsignada.id, target.phone, personalized, sendOptions)
-        }
-
-        const exactMessageId = sendResult?.messageId
+      } else {
+        console.log(`🛑 TODAS LAS LÍNEAS CAÍDAS (catch). Deteniendo campaña ${campaignId}`)
+        results.push({ phone: target.phone, status: 'failed', error: err.message, index: i })
 
         await this.prisma.campaign_logs.create({
           data: {
             campaign_id: campaignId,
             line_id: lineaAsignada.id,
             contact_phone: target.phone,
-            status: 'sent',
-            message_id: exactMessageId,
+            status: 'failed',
+            error: 'Todas las líneas caídas - Campaña detenida',
             owner_id: options.ownerId || null,
           }
         }).catch(() => {})
 
-        await this.prisma.campaigns.update({
-          where: { id: campaignId },
-          data: { sent: { increment: 1 } }
-        }).catch(e => console.error(`[DB] Error incrementando sent:`, e.message))
-
-        results.push({ phone: target.phone, status: 'sent', lineId: lineaAsignada.id, index: i })
-
-        this.io.emit('campaign_log', {
-          campaignId: campaignId,
-          campaign_id: campaignId,
-          phone: target.phone,
-          contact_phone: target.phone,
-          status: 'sent',
-          lineId: lineaAsignada.id,
-          line_id: lineaAsignada.id,
-          linePhone: lineaAsignada.phone,
-          delayMs: lastDelayMs,
-          line_phone: lineaAsignada.phone,
-          progress: `${i + 1}/${targets.length}`
-        })
-
-        console.log(`✅ ${i + 1}/${targets.length} → ${maskPhone(target.phone)} [${maskPhone(lineaAsignada.phone)}]`)
-        lineaIndex++
-
-      } catch (err) {
-        console.error(`❌ ${maskPhone(target.phone)} [${maskPhone(lineaAsignada.phone)}]:`, err.message)
-        lineasCaidas.add(lineaAsignada.id)
-
-        await this.prisma.campaigns.update({
-          where: { id: campaignId },
-          data: { failed: { increment: 1 } }
-        }).catch(() => {})
-
-        this.io.emit('campaign_log', {
+        const emergencyPayload = {
           campaignId: campaignId,
           campaign_id: campaignId,
           phone: target.phone,
           contact_phone: target.phone,
           status: 'failed',
           lineId: lineaAsignada.id,
-          delayMs: lastDelayMs,
           line_id: lineaAsignada.id,
           linePhone: lineaAsignada.phone,
           line_phone: lineaAsignada.phone,
-          error: err.message?.slice(0, 200),
-          progress: `${i + 1}/${targets.length}`
-        })
-
-        await this.prisma.campaign_logs.create({
-          data: {
-            campaign_id: campaignId,
-            line_id: lineaAsignada.id,
-            contact_phone: target.phone,
-            status: 'failed',
-            error: err.message?.slice(0, 200),
-            owner_id: options.ownerId || null,
-          }
-        }).catch(() => {})
-
-        const quedanLineas = lineasActivas.some(l => !lineasCaidas.has(l.id))
-        if (quedanLineas) {
-          i--
-        } else {
-          console.log(`🛑 TODAS LAS LÍNEAS CAÍDAS (catch). Deteniendo campaña ${campaignId}`)
-          results.push({ phone: target.phone, status: 'failed', error: err.message, index: i })
-
-          await this.prisma.campaign_logs.create({
-            data: {
-              campaign_id: campaignId,
-              line_id: lineaAsignada.id,
-              contact_phone: target.phone,
-              status: 'failed',
-              error: 'Todas las líneas caídas - Campaña detenida',
-              owner_id: options.ownerId || null,
-            }
-          }).catch(() => {})
-
-          this.io.emit('campaign_log', {
-            campaignId: campaignId,
-            campaign_id: campaignId,
-            phone: target.phone,
-            contact_phone: target.phone,
-            status: 'failed',
-            lineId: lineaAsignada.id,
-            line_id: lineaAsignada.id,
-            linePhone: lineaAsignada.phone,
-            line_phone: lineaAsignada.phone,
-            error: 'TODAS LAS LÍNEAS CAÍDAS - CAMPAÑA DETENIDA',
-            progress: `${i + 1}/${targets.length}`,
-            isEmergencyStop: true
-          })
-
-          wasCancelled = true
-          break
+          error: 'TODAS LAS LÍNEAS CAÍDAS - CAMPAÑA DETENIDA',
+          progress: `${i + 1}/${targets.length}`,
+          isEmergencyStop: true
         }
+        if (options.ownerId && this.io.emitToUser) {
+          this.io.emitToUser(options.ownerId, 'campaign_log', emergencyPayload)
+        } else {
+          this.io.emit('campaign_log', emergencyPayload)
+        }
+
+        wasCancelled = true
+        break
       }
-
-      if (i < targets.length - 1 && !wasCancelled) {
-        const baseDelay = Math.floor(Math.random() * (delayMax - delayMin + 1)) + delayMin
-        const humanExtra = options.humanMode ? (3000 + Math.random() * 5000) : 0
-        lastDelayMs = baseDelay + humanExtra
-        console.log(`[DELAY] Esperando ${lastDelayMs}ms antes del siguiente mensaje`)
-        await new Promise(r => setTimeout(r, lastDelayMs))
-      }
     }
 
-    const finalStatus = wasCancelled ? 'cancelled' : 'completed'
-    await this.prisma.campaigns.update({
-      where: { id: campaignId },
-      data: { status: finalStatus, finished_at: new Date() }
-    }).catch(() => {})
-
-    console.log('🔥 EMITIENDO campaign_complete:', {
-      campaignId,
-      sent: results.filter(r => r.status === 'sent').length,
-      failed: results.filter(r => r.status === 'failed').length
-    })
-
-        const ownerId = options.ownerId || null
-    const payload = {
-      campaignId: campaignId,
-      campaign_id: campaignId,
-      status: finalStatus,
-      sent: results.filter(r => r.status === 'sent').length,
-      failed: results.filter(r => r.status === 'failed').length,
-      total_sent: results.filter(r => r.status === 'sent').length,
-      total_failed: results.filter(r => r.status === 'failed').length
+    if (i < targets.length - 1 && !wasCancelled) {
+      const baseDelay = Math.floor(Math.random() * (delayMax - delayMin + 1)) + delayMin
+      const humanExtra = options.humanMode ? (3000 + Math.random() * 5000) : 0
+      lastDelayMs = baseDelay + humanExtra
+      console.log(`[DELAY] Esperando ${lastDelayMs}ms antes del siguiente mensaje`)
+      await new Promise(r => setTimeout(r, lastDelayMs))
     }
-    if (ownerId && this.io.emitToUser) {
-      this.io.emitToUser(ownerId, 'campaign_complete', payload)
-    } else {
-      this.io.emit('campaign_complete', payload)
-    }
-
-    console.log(`[CAMPAIGN] ${campaignId} finalizada. Results:`, results.length, 'sent:', results.filter(r => r.status === 'sent').length, 'failed:', results.filter(r => r.status === 'failed').length)
-
-    return results
   }
+
+  const finalStatus = wasCancelled ? 'cancelled' : 'completed'
+  await this.prisma.campaigns.update({
+    where: { id: campaignId },
+    data: { status: finalStatus, finished_at: new Date() }
+  }).catch(() => {})
+
+  console.log('🔥 EMITIENDO campaign_complete:', {
+    campaignId,
+    sent: results.filter(r => r.status === 'sent').length,
+    failed: results.filter(r => r.status === 'failed').length
+  })
+
+  const ownerId = options.ownerId || null
+  const completePayload = {
+    campaignId: campaignId,
+    campaign_id: campaignId,
+    status: finalStatus,
+    sent: results.filter(r => r.status === 'sent').length,
+    failed: results.filter(r => r.status === 'failed').length,
+    total_sent: results.filter(r => r.status === 'sent').length,
+    total_failed: results.filter(r => r.status === 'failed').length
+  }
+  if (ownerId && this.io.emitToUser) {
+    this.io.emitToUser(ownerId, 'campaign_complete', completePayload)
+  } else {
+    this.io.emit('campaign_complete', completePayload)
+  }
+
+  console.log(`[CAMPAIGN] ${campaignId} finalizada. Results:`, results.length, 'sent:', results.filter(r => r.status === 'sent').length, 'failed:', results.filter(r => r.status === 'failed').length)
+
+  return results
+}
 
       async logout(lineId) {
     if (this.reconnectTimers[lineId]) {

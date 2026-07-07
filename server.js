@@ -49,23 +49,59 @@ const io = new Server(server, {
     methods: ['GET', 'POST'],
     credentials: true 
   },
+  // 🔴 CRÍTICO para Railway: mantener conexión viva
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  transports: ['websocket', 'polling'],
 })
 
-// 🔒 Middleware de autenticación en Socket.IO
+// Set de usuarios conectados (por userId, no por token)
+const connectedUsers = new Set()
+
+// 🔒 Middleware de autenticación
 io.use((socket, next) => {
-  const token = socket.handshake.auth?.token || 
-                socket.handshake.headers?.authorization?.replace('Bearer ', '')
-  if (!token) return next(new Error('No autenticado'))
-  const decoded = verifyToken(token)
-  if (!decoded) return next(new Error('Token inválido'))
-  socket.userId = decoded.userId
-  next()
+  try {
+    const token = socket.handshake.auth?.token || 
+                  socket.handshake.headers?.authorization?.replace('Bearer ', '')
+    if (!token) return next(new Error('NO_AUTH'))
+
+    const decoded = verifyToken(token)
+    if (!decoded) return next(new Error('INVALID_TOKEN'))
+
+    socket.userId = decoded.userId
+    socket.decoded = decoded
+    next()
+  } catch (err) {
+    return next(new Error('AUTH_ERROR'))
+  }
 })
+
 
 io.on('connection', (socket) => {
-  console.log('🟢 Socket conectado:', socket.userId)
-  socket.join(`user:${socket.userId}`)
-})
+  const userId = socket.userId || socket.id
+  
+  // Unir al room del usuario
+  socket.join(`user:${userId}`)
+  
+  // Log solo la PRIMERA vez que este userId se conecta
+  if (!connectedUsers.has(userId)) {
+    connectedUsers.add(userId)
+    console.log(`🟢 Socket conectado: ${userId}`)
+  }
+  
+  socket.on('disconnect', (reason) => {
+    // Darle tiempo a reconectar antes de considerarlo desconectado
+    setTimeout(() => {
+      const stillConnected = Array.from(io.sockets.sockets.values())
+        .some(s => s.userId === userId)
+      
+      if (!stillConnected && connectedUsers.has(userId)) {
+        connectedUsers.delete(userId)
+        console.log(`🔴 Socket desconectado: ${userId} (${reason})`)
+      }
+    }, 5000)
+  })
+})  
 
 // Helper para emitir solo al usuario dueño
 io.emitToUser = (userId, event, payload) => {
@@ -119,15 +155,26 @@ function safeCompare(a, b) {
 function validateLicense(token) {
   try {
     const decoded = jwt.verify(token, LICENSE_PUBLIC_KEY, { algorithms: ['RS256'] })
-    if (!decoded.tier || !TIER_LIMITS[decoded.tier]) {
-      console.error('❌ Licencia con tier inválido:', decoded.tier)
-      return null
-    }
-    const VALID_ISSUERS = ['wabisend-v1', 'wabisend-v2', 'mundial-blaster-v1']
+    
+    // Validar issuer
+    const VALID_ISSUERS = ['wabisend-v1', 'wabisend-v2', 'wabisend-v3']
     if (!VALID_ISSUERS.includes(decoded.iss)) {
-      console.error('❌ Issuer inválido o ausente:', decoded.iss)
+      console.error('❌ Issuer inválido:', decoded.iss)
       return null
     }
+    
+    // Validar tier
+    if (!decoded.tier || !TIER_LIMITS[decoded.tier]) {
+      console.error('❌ Tier inválido:', decoded.tier)
+      return null
+    }
+    
+    // Validar expiración si existe
+    if (decoded.exp && Math.floor(Date.now() / 1000) > decoded.exp) {
+      console.error('❌ Licencia expirada')
+      return null
+    }
+    
     return decoded
   } catch (e) {
     console.error('❌ Error validando licencia:', e.message)
@@ -331,13 +378,27 @@ async function requireLicense(req, res, next) {
     if (!config?.value) {
       return res.status(403).json({ error: 'Licencia no activada. Andá a /setup' })
     }
+
     const license = validateLicense(config.value)
     if (!license) {
       return res.status(403).json({ error: 'Licencia inválida o expirada' })
     }
+
+    // 🔐 Verificar instance_id en cada request (anti-clonación)
+    const storedInstanceId = await prisma.app_config.findUnique({ where: { key: 'instance_id' } })
+    const jwtInstanceId = license.instance_id
+
+    if (jwtInstanceId && storedInstanceId?.value && storedInstanceId.value !== jwtInstanceId) {
+      return res.status(403).json({
+        error: 'Licencia no válida para esta instancia. Contactá soporte.',
+        code: 'INSTANCE_MISMATCH'
+      })
+    }
+
     req.license = license
     next()
   } catch (e) {
+    console.error('requireLicense error:', e)
     res.status(500).json({ error: 'Error validando licencia' })
   }
 }
@@ -1244,7 +1305,7 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
     })
   } catch (e) {
     console.error('💥 Error creando campaña:', e)
-    res.status(500).json({ error: 'Error creando campaña', detail: e.message })
+    res.status(500).json({ error: 'Error creando campaña' })
   }
 })
 
@@ -1286,13 +1347,10 @@ app.get('/api/campaigns', authOrSecret, requireLicense, async (req, res) => {
 app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
   try {
     const { period } = req.query
-        console.log('📊 REPORT DEBUG ==================')
-    console.log('📊 tier:', req.tier)
-    console.log('📊 userId:', req.user?.id || 'null/undefined')
-    console.log('📊 period param:', period)
+        
     let dateFilter = {}
     if (req.tier === 'starter') {
-    console.log('📊 Applying STARTER filter: 30d')
+    
       dateFilter = { created_at: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } }
     } else {
     console.log('📊 Applying PRO/BUSINESS filter for period:', period)
@@ -1309,8 +1367,6 @@ app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
       }
     }
     const userId = req.user?.id || null
-    console.log('📊 dateFilter:', JSON.stringify(dateFilter))
-    console.log('📊 userId for where:', userId)
     const campaigns = await prisma.campaigns.findMany({
       where: {
         ...dateFilter,
@@ -1319,17 +1375,17 @@ app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
       orderBy: { created_at: 'desc' }
     })
 
-    console.log('📊 campaigns found:', campaigns.length)
-    if (campaigns.length > 0) {
-      console.log('📊 first campaign:', {
-        id: campaigns[0].id,
-        status: campaigns[0].status,
-        sent: campaigns[0].sent,
-        owner_id: campaigns[0].owner_id,
-        created_at: campaigns[0].created_at
-      })
-    }
-    console.log('📊 END DEBUG ==================')
+    // console.log('📊 campaigns found:', campaigns.length)
+    // if (campaigns.length > 0) {
+    //   console.log('📊 first campaign:', {
+    //     id: campaigns[0].id,
+    //     status: campaigns[0].status,
+    //     sent: campaigns[0].sent,
+    //     owner_id: campaigns[0].owner_id,
+    //     created_at: campaigns[0].created_at
+    //   })
+    // }
+    
     const campaignsWithScheduled = await Promise.all(campaigns.map(async (c) => {
       const scheduled = await prisma.scheduled_campaigns.findUnique({
         where: { campaign_id: c.id }
@@ -1429,6 +1485,11 @@ app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
 
 app.post('/api/campaigns/simulate', authOrSecret, async (req, res) => {
   try {
+    const licenseConfig = await prisma.app_config.findUnique({ where: { key: 'license' } })
+    if (!licenseConfig?.value) return res.status(403).json({ error: 'LICENSE_REQUIRED' })
+    const license = validateLicense(licenseConfig.value)
+    if (!license) return res.status(403).json({ error: 'LICENSE_INVALID' })
+    if (license.tier === 'starter') return res.status(403).json({ error: 'Simulacro requiere Pro o Business' })
     const { targets, line_ids, mode = 'lite' } = req.body
     if (!targets?.length) return res.status(400).json({ error: 'Agregá números' })
     if (!line_ids?.length) return res.status(400).json({ error: 'Seleccioná al menos una línea' })
@@ -1694,7 +1755,14 @@ app.delete('/api/campaigns/:id', authOrSecret, requireLicense, async (req, res) 
 })
 
 app.get('/api/campaigns/:id/export', authOrSecret, loadTier, requireFeature('hasExport'), async (req, res) => {
+  
   try {
+      // 🔐 Inline license check (redundante pero resistente a bypass de middleware)
+    const licenseConfig = await prisma.app_config.findUnique({ where: { key: 'license' } })
+    if (!licenseConfig?.value) return res.status(403).json({ error: 'LICENSE_REQUIRED' })
+    const license = validateLicense(licenseConfig.value)
+    if (!license) return res.status(403).json({ error: 'LICENSE_INVALID' })
+    if (license.tier === 'starter') return res.status(403).json({ error: 'TIER_UPGRADE_REQUIRED' })
     const { id } = req.params
     const userId = req.user?.id || null
     const campaign = await prisma.campaigns.findFirst({
@@ -1834,7 +1902,7 @@ app.post('/api/blacklist', authOrSecret, loadTier, requireFeature('hasBlacklist'
     res.json({ success: true, entry })
   } catch (e) {
     console.error('Blacklist POST error:', e)
-    res.status(500).json({ error: 'Error agregando a blacklist', detail: e.message })
+    res.status(500).json({ error: 'Error agregando a blacklist' })
   }
 })
 
@@ -1853,7 +1921,7 @@ app.delete('/api/blacklist/:phone', authOrSecret, loadTier, requireFeature('hasB
     res.json({ success: true, phone: cleanPhone })
   } catch (e) {
     console.error('Blacklist delete error:', e)
-    res.status(500).json({ error: 'Error eliminando de blacklist', detail: e.message })
+    res.status(500).json({ error: 'Error eliminando de blacklist' })
   }
 })
 
@@ -2430,36 +2498,73 @@ app.get('/api/replies/global', authOrSecret, async (req, res) => {
   }
 })
 
-// ========== LICENCIA + ANTI-CLONACIÓN ==========
+
 app.post('/api/setup/activate', async (req, res) => {
   try {
     const { licenseKey } = req.body
     if (!licenseKey) return res.status(400).json({ error: 'licenseKey required' })
+
     const license = validateLicense(licenseKey)
     if (!license) return res.status(400).json({ error: 'Licencia inválida' })
-    const instanceDomain = process.env.RAILWAY_STATIC_URL ||
-                           process.env.VERCEL_URL ||
-                           req.headers.host
+
+    const instanceDomain = process.env.RAILWAY_STATIC_URL || process.env.VERCEL_URL || req.headers.host
+
+    // Domain binding
     if (license.domain && license.domain !== instanceDomain) {
-      return res.status(403).json({
-        error: 'Licencia no válida para este dominio',
-        licensedDomain: license.domain,
-        currentDomain: instanceDomain
-      })
+      return res.status(403).json({ error: 'Licencia no válida para este dominio' })
     }
+
+    // 🔐 UN SOLO USO: verificar instance_id
+    const storedInstanceId = await prisma.app_config.findUnique({ where: { key: 'instance_id' } })
+    const jwtInstanceId = license.instance_id
+
+    if (jwtInstanceId) {
+      // Si ya hay una instancia guardada y no coincide → CLONACIÓN
+      if (storedInstanceId?.value && storedInstanceId.value !== jwtInstanceId) {
+        // 🚨 ALERTA: Alguien intentó usar esta licencia en otra instancia
+        await alertOwner('CLONACION_DETECTADA', {
+          licenseId: license.license_id,
+          email: license.email,
+          instanceId: jwtInstanceId,
+          domain: instanceDomain,
+          storedInstanceId: storedInstanceId.value
+        })
+        return res.status(403).json({
+          error: 'Licencia ya activada en otra instancia. Contactá soporte.',
+          code: 'LICENSE_BOUND_TO_OTHER_INSTANCE'
+        })
+      }
+      
+      // Primera activación: guardar instance_id
+      if (!storedInstanceId?.value) {
+        await prisma.app_config.upsert({
+          where: { key: 'instance_id' },
+          update: { value: jwtInstanceId },
+          create: { key: 'instance_id', value: jwtInstanceId }
+        })
+      }
+    }
+
+    // Guardar licencia
     await prisma.app_config.upsert({
       where: { key: 'license' },
       update: { value: licenseKey },
       create: { key: 'license', value: licenseKey }
     })
-    await prisma.app_config.upsert({
-      where: { key: 'instance_domain' },
-      update: { value: instanceDomain },
-      create: { key: 'instance_domain', value: instanceDomain }
-    })
+
     tierCache = null
     tierCacheTime = 0
-    res.json({ success: true, tier: license.tier, features: license })
+
+    // 🟢 ALERTA: Activación exitosa (para tu registro)
+    await alertOwner('ACTIVACION_EXITOSA', {
+      licenseId: license.license_id,
+      email: license.email,
+      instanceId: jwtInstanceId,
+      domain: instanceDomain,
+      tier: license.tier
+    })
+
+    res.json({ success: true, tier: license.tier, instanceId: jwtInstanceId })
   } catch (e) {
     console.error('Setup activate error:', e)
     res.status(500).json({ error: 'Error activando licencia' })
@@ -2565,9 +2670,25 @@ app.post('/api/admin/reset-user', authMiddleware, async (req, res) => {
   }
 })
 
-// ========== CRON ==========
 cron.schedule('*/5 * * * *', async () => {
   try {
+    // 🛑 Si el tier es Starter, no ejecutar cron (ahorro de recursos)
+    const currentTier = await getAppTier()
+    if (currentTier === 'starter') {
+      return
+    }
+
+    // 🔄 Reconnect silencioso si Neon cerró la conexión
+    try {
+      await prisma.$queryRaw`SELECT 1`
+    } catch (connErr) {
+      if (connErr.code === 'P1017') {
+        await prisma.$disconnect()
+        await prisma.$connect()
+        console.log('🔄 Prisma reconnected after timeout')
+      }
+    }
+
     const now = new Date()
     const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000)
     const pending = await prisma.scheduled_campaigns.findMany({
@@ -2640,6 +2761,21 @@ cron.schedule('*/5 * * * *', async () => {
     console.error('⏰ Error cron scheduled campaigns:', e)
   }
 })
+
+
+async function alertOwner(type, data) {
+  const WEBHOOK = process.env.ALERT_WEBHOOK
+  if (!WEBHOOK) return
+  try {
+    await fetch(WEBHOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: `\nTipo: ${type}\nLicense: ${data.licenseId || 'N/A'}\nEmail: ${data.email || 'N/A'}\nInstance: ${data.instanceId || 'N/A'}\nDominio: ${data.domain || 'N/A'}\nFecha: ${new Date().toLocaleString('es-AR')}`
+      })
+    })
+  } catch (e) { /* Silencioso. Nunca falla. */ }
+}
 
 // ============================================================
 // SERVER START
