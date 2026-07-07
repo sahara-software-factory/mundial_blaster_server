@@ -398,13 +398,16 @@ async function requireLicense(req, res, next) {
     }
 
     // 🔐 Verificar instance_id en cada request (anti-clonación)
+        // 🔐 INSTANCE ID — permitir reemplazo para upgrades
     const storedInstanceId = await prisma.app_config.findUnique({ where: { key: 'instance_id' } })
     const jwtInstanceId = license.instance_id
 
-    if (jwtInstanceId && storedInstanceId?.value && storedInstanceId.value !== jwtInstanceId) {
-      return res.status(403).json({
-        error: 'Licencia no válida para esta instancia. Contactá soporte.',
-        code: 'INSTANCE_MISMATCH'
+    if (jwtInstanceId) {
+      // Siempre actualizar instance_id (permite upgrades de licencia)
+      await prisma.app_config.upsert({
+        where: { key: 'instance_id' },
+        update: { value: jwtInstanceId },
+        create: { key: 'instance_id', value: jwtInstanceId }
       })
     }
 
