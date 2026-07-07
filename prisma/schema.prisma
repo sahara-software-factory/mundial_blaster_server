@@ -291,3 +291,17 @@ model proxy_history {
   @@index([owner_id])
   @@index([usedAt])
 }
+
+model bases_datos {
+  id          String   @id @default(uuid())
+  usuario_id  String
+  nombre      String
+  color       String   @default("#6366f1")
+  contenido   String   @db.Text
+  total       Int      @default(0)
+  duplicados  Int      @default(0)
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  @@index([usuario_id])
+}

@@ -1745,18 +1745,17 @@ app.post('/api/campaigns/:id/clone', authOrSecret, loadTier, requireFeature('has
 app.delete('/api/campaigns/:id', authOrSecret, requireLicense, async (req, res) => {
   try {
     const { id } = req.params
-    const userId = req.user?.id || req.userId
-    const campaign = await prisma.campaigns.findFirst({
-      where: {
-        id,
-        OR: [
-          { owner_id: userId },
-          { owner_id: null }
-        ]
-      }
-    })
+    const userId = req.user?.id || null
+    
+    const where = { id }
+    if (userId) {
+      where.OR = [{ owner_id: userId }, { owner_id: null }]
+    }
+    
+    const campaign = await prisma.campaigns.findFirst({ where })
     if (!campaign) return res.status(404).json({ error: 'Campaña no encontrada' })
     if (campaign.status === 'running') return res.status(400).json({ error: 'No se puede eliminar una campaña en ejecución. Parala primero.' })
+    
     await prisma.$transaction([
       prisma.campaign_logs.deleteMany({ where: { campaign_id: id } }),
       prisma.campaigns.delete({ where: { id } })
@@ -2656,6 +2655,115 @@ app.post('/api/admin/reset-user', authMiddleware, async (req, res) => {
   } catch (e) {
     console.error('Admin reset error:', e)
     res.status(500).json({ error: 'Error reseteando usuario' })
+  }
+})
+
+
+function parsearNumeros(texto) {
+  const raw = texto
+    .replace(/[^\d\s,\n;]/g, '')
+    .split(/[\s,\n;]+/)
+    .map(n => n.trim())
+    .filter(n => n.length >= 8 && n.length <= 15)
+
+  const unicos = [...new Set(raw)]
+  return {
+    limpio: unicos.join('\n'),
+    total: unicos.length,
+    duplicados: raw.length - unicos.length
+  }
+}
+
+app.get('/api/bases-datos', authOrSecret, requireLicense, async (req, res) => {
+  try {
+    const ownerId = getOwnerId(req)
+    const bases = await prisma.bases_datos.findMany({
+      where: { usuario_id: ownerId },
+      orderBy: { created_at: 'desc' }
+    })
+    res.json({ success: true, bases })
+  } catch (e) {
+    res.status(500).json({ error: 'Error listando bases' })
+  }
+})
+
+app.get('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res) => {
+  try {
+    const ownerId = getOwnerId(req)
+    const base = await prisma.bases_datos.findFirst({
+      where: { id: req.params.id, usuario_id: ownerId }
+    })
+    if (!base) return res.status(404).json({ error: 'Base no encontrada' })
+    res.json({ success: true, base })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.post('/api/bases-datos', authOrSecret, requireLicense, async (req, res) => {
+  try {
+    const ownerId = getOwnerId(req)
+    const { nombre, color, contenido } = req.body
+    if (!nombre?.trim() || !contenido?.trim()) {
+      return res.status(400).json({ error: 'Nombre y contenido requeridos' })
+    }
+    const parsed = parsearNumeros(contenido)
+    const base = await prisma.bases_datos.create({
+      data: {
+        usuario_id: ownerId,
+        nombre: nombre.trim(),
+        color: color || '#6366f1',
+        contenido: parsed.limpio,
+        total: parsed.total,
+        duplicados: parsed.duplicados
+      }
+    })
+    res.json({ success: true, base })
+  } catch (e) {
+    res.status(500).json({ error: 'Error creando base' })
+  }
+})
+
+app.patch('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res) => {
+  try {
+    const ownerId = getOwnerId(req)
+    const { nombre, color, contenido } = req.body
+    const existing = await prisma.bases_datos.findFirst({
+      where: { id: req.params.id, usuario_id: ownerId }
+    })
+    if (!existing) return res.status(404).json({ error: 'Base no encontrada' })
+
+    const updateData = {}
+    if (nombre !== undefined) updateData.nombre = nombre.trim()
+    if (color !== undefined) updateData.color = color
+    if (contenido !== undefined) {
+      const parsed = parsearNumeros(contenido)
+      updateData.contenido = parsed.limpio
+      updateData.total = parsed.total
+      updateData.duplicados = parsed.duplicados
+    }
+
+    const base = await prisma.bases_datos.update({
+      where: { id: req.params.id },
+      data: updateData
+    })
+    res.json({ success: true, base })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.delete('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res) => {
+  try {
+    const ownerId = getOwnerId(req)
+    const existing = await prisma.bases_datos.findFirst({
+      where: { id: req.params.id, usuario_id: ownerId }
+    })
+    if (!existing) return res.status(404).json({ error: 'Base no encontrada' })
+    await prisma.bases_datos.delete({ where: { id: req.params.id } })
+    res.json({ success: true })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
   }
 })
 
