@@ -153,6 +153,25 @@ function safeCompare(a, b) {
   return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b))
 }
 
+function parsearNumeros(texto) {
+  const raw = texto
+    .replace(/[^\d\s,\n;]/g, '')
+    .split(/[\s,\n;]+/)
+    .map(n => n.trim())
+    .filter(n => n.length >= 8 && n.length <= 15)
+
+  const unicos = [...new Set(raw)]
+  return {
+    limpio: unicos.join('\n'),
+    total: unicos.length,
+    duplicados: raw.length - unicos.length
+  }
+}
+
+function getOwnerId(req) {
+  return req.user?.id || req.user?.sub || null
+}
+
 function validateLicense(token) {
   try {
     const decoded = jwt.verify(token, LICENSE_PUBLIC_KEY, { algorithms: ['RS256'] })
@@ -2659,30 +2678,25 @@ app.post('/api/admin/reset-user', authMiddleware, async (req, res) => {
 })
 
 
-function parsearNumeros(texto) {
-  const raw = texto
-    .replace(/[^\d\s,\n;]/g, '')
-    .split(/[\s,\n;]+/)
-    .map(n => n.trim())
-    .filter(n => n.length >= 8 && n.length <= 15)
 
-  const unicos = [...new Set(raw)]
-  return {
-    limpio: unicos.join('\n'),
-    total: unicos.length,
-    duplicados: raw.length - unicos.length
-  }
-}
+// ============================================
+// BASES DE DATOS
+// ============================================
+
+
 
 app.get('/api/bases-datos', authOrSecret, requireLicense, async (req, res) => {
   try {
     const ownerId = getOwnerId(req)
+    if (!ownerId) return res.status(401).json({ error: 'Usuario no identificado' })
+    
     const bases = await prisma.bases_datos.findMany({
       where: { usuario_id: ownerId },
       orderBy: { created_at: 'desc' }
     })
     res.json({ success: true, bases })
   } catch (e) {
+    console.error('Error listando bases:', e)
     res.status(500).json({ error: 'Error listando bases' })
   }
 })
@@ -2690,6 +2704,8 @@ app.get('/api/bases-datos', authOrSecret, requireLicense, async (req, res) => {
 app.get('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res) => {
   try {
     const ownerId = getOwnerId(req)
+    if (!ownerId) return res.status(401).json({ error: 'Usuario no identificado' })
+    
     const base = await prisma.bases_datos.findFirst({
       where: { id: req.params.id, usuario_id: ownerId }
     })
@@ -2703,11 +2719,15 @@ app.get('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res) =
 app.post('/api/bases-datos', authOrSecret, requireLicense, async (req, res) => {
   try {
     const ownerId = getOwnerId(req)
+    if (!ownerId) return res.status(401).json({ error: 'Usuario no identificado' })
+    
     const { nombre, color, contenido } = req.body
     if (!nombre?.trim() || !contenido?.trim()) {
       return res.status(400).json({ error: 'Nombre y contenido requeridos' })
     }
+
     const parsed = parsearNumeros(contenido)
+
     const base = await prisma.bases_datos.create({
       data: {
         usuario_id: ownerId,
@@ -2718,8 +2738,10 @@ app.post('/api/bases-datos', authOrSecret, requireLicense, async (req, res) => {
         duplicados: parsed.duplicados
       }
     })
+
     res.json({ success: true, base })
   } catch (e) {
+    console.error('Error creando base:', e)
     res.status(500).json({ error: 'Error creando base' })
   }
 })
@@ -2727,6 +2749,8 @@ app.post('/api/bases-datos', authOrSecret, requireLicense, async (req, res) => {
 app.patch('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res) => {
   try {
     const ownerId = getOwnerId(req)
+    if (!ownerId) return res.status(401).json({ error: 'Usuario no identificado' })
+    
     const { nombre, color, contenido } = req.body
     const existing = await prisma.bases_datos.findFirst({
       where: { id: req.params.id, usuario_id: ownerId }
@@ -2747,6 +2771,7 @@ app.patch('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res)
       where: { id: req.params.id },
       data: updateData
     })
+
     res.json({ success: true, base })
   } catch (e) {
     res.status(500).json({ error: e.message })
@@ -2756,10 +2781,13 @@ app.patch('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res)
 app.delete('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res) => {
   try {
     const ownerId = getOwnerId(req)
+    if (!ownerId) return res.status(401).json({ error: 'Usuario no identificado' })
+    
     const existing = await prisma.bases_datos.findFirst({
       where: { id: req.params.id, usuario_id: ownerId }
     })
     if (!existing) return res.status(404).json({ error: 'Base no encontrada' })
+
     await prisma.bases_datos.delete({ where: { id: req.params.id } })
     res.json({ success: true })
   } catch (e) {
