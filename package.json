@@ -3,9 +3,8 @@
   "version": "1.0.0",
   "packageManager": "pnpm@8.15.0",
   "scripts": {
-    "start": "node init-db.js && node server.js",
-    "postinstall": "prisma generate",
-    "migrate": "prisma migrate deploy"
+    "start": "npx prisma db push --accept-data-loss --skip-generate && node server.js",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",

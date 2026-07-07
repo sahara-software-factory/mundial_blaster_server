@@ -29,7 +29,8 @@ const allowedOrigins = [
   'http://localhost:3000',
   'http://127.0.0.1:3000',
   'https://wabisend.com',
-  'https://www.wabisend.com'
+  'https://www.wabisend.com',
+  'https://mundial-blaster-web-three.vercel.app'
 ]
 
 app.use(cors({
@@ -200,18 +201,30 @@ function verifyToken(token) {
 
 async function ensureJwtSecret() {
   if (JWT_SECRET) return JWT_SECRET
-  const config = await prisma.app_config.findUnique({ where: { key: 'jwt_secret' } })
-  if (config?.value) {
-    JWT_SECRET = config.value
+  
+  // 🛡️ Fallback: si la DB está rota, usar variable de entorno o generar al vuelo
+  if (process.env.JWT_SECRET) {
+    JWT_SECRET = process.env.JWT_SECRET
     return JWT_SECRET
   }
-  const newSecret = crypto.randomBytes(64).toString('hex')
-  await prisma.app_config.create({
-    data: { key: 'jwt_secret', value: newSecret }
-  })
-  JWT_SECRET = newSecret
-  console.log('🔐 JWT_SECRET auto-generada y guardada en DB')
-  return JWT_SECRET
+  
+  try {
+    const config = await prisma.app_config.findUnique({ where: { key: 'jwt_secret' } })
+    if (config?.value) {
+      JWT_SECRET = config.value
+      return JWT_SECRET
+    }
+    const newSecret = crypto.randomBytes(64).toString('hex')
+    await prisma.app_config.create({
+      data: { key: 'jwt_secret', value: newSecret }
+    })
+    JWT_SECRET = newSecret
+    return JWT_SECRET
+  } catch (e) {
+    console.error('⚠️ DB app_config rota, usando JWT_SECRET de env:', e.message)
+    JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex')
+    return JWT_SECRET
+  }
 }
 
 ensureJwtSecret().catch(e => {
