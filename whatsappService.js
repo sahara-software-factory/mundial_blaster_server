@@ -31,9 +31,11 @@ function maskPhone(p) {
 }
 
 class WAService {
-  constructor(prisma, io) {
+   constructor(prisma, io, validateLicenseFn, tierLimits) {
     this.prisma = prisma
     this.io = io
+    this.validateLicense = validateLicenseFn
+    this.tierLimits = tierLimits || {}
     this.clients = new Map()
     this.reconnectTimers = {}
     this.presenceIntervals = {}
@@ -75,19 +77,25 @@ class WAService {
 
  async connect(phone) {
     // 🔐 INLINE LICENSE CHECK (no fatal)
+        // 🔐 INLINE LICENSE CHECK (no fatal)
     try {
       const licenseConfig = await this.prisma.app_config.findUnique({ where: { key: 'license' } })
       if (!licenseConfig?.value) {
         console.log('⏳ Sin licencia activa, omitiendo connect WhatsApp')
         return null
       }
-      const license = validateLicense(licenseConfig.value)
+      const license = this.validateLicense(licenseConfig.value)
       if (!license) {
         console.log('⏳ Licencia inválida, omitiendo connect WhatsApp')
         return null
       }
-      const tierConfig = TIER_LIMITS[license.tier]
-      const activeLines = await this.prisma.lineas_whatsapp.count({ where: { status: 'CONECTADA' } })
+      
+      const tierConfig = this.tierLimits[license.tier]
+      if (!tierConfig) {
+        console.log('⏳ Tier no encontrado, omitiendo connect')
+        return null
+      }
+      const activeLines = await this.prisma.lineas_whatsapp.count({ where: { status: 'CONECTADA' } }).catch(() => 0)
       if (activeLines >= tierConfig.maxLines) {
         console.log('⏳ Límite de líneas alcanzado')
         return null

@@ -427,7 +427,7 @@ async function requireLicense(req, res, next) {
 // ============================================================
 // WHATSAPP SERVICE
 // ============================================================
-const waService = new WAService(prisma, io)
+const waService = new WAService(prisma, io, validateLicense, TIER_LIMITS)
 waService.init()
 
 io.on('connection', () => console.log('🟢 Socket conectado'))
