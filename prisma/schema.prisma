@@ -294,7 +294,7 @@ model proxy_history {
 
 model bases_datos {
   id          String   @id @default(uuid())
-  usuario_id  String
+  usuario_id  String?  
   nombre      String
   color       String   @default("#6366f1")
   contenido   String   @db.Text
