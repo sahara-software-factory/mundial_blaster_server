@@ -168,9 +168,9 @@ function parsearNumeros(texto) {
   }
 }
 
-function getOwnerId(req) {
-  return req.user?.id || req.user?.sub || null
-}
+// function getOwnerId(req) {
+//   return req.user?.id || req.user?.sub || null
+// }
 
 function validateLicense(token) {
   try {
@@ -2687,11 +2687,11 @@ app.post('/api/admin/reset-user', authMiddleware, async (req, res) => {
 
 app.get('/api/bases-datos', authOrSecret, requireLicense, async (req, res) => {
   try {
-    const ownerId = getOwnerId(req)
-    if (!ownerId) return res.status(401).json({ error: 'Usuario no identificado' })
+    const userId = req.user?.id || null
+    const where = userId ? { OR: [{ usuario_id: userId }, { usuario_id: null }] } : {}
     
     const bases = await prisma.bases_datos.findMany({
-      where: { usuario_id: ownerId },
+      where,
       orderBy: { created_at: 'desc' }
     })
     res.json({ success: true, bases })
@@ -2703,12 +2703,13 @@ app.get('/api/bases-datos', authOrSecret, requireLicense, async (req, res) => {
 
 app.get('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res) => {
   try {
-    const ownerId = getOwnerId(req)
-    if (!ownerId) return res.status(401).json({ error: 'Usuario no identificado' })
+    const userId = req.user?.id || null
+    const where = { id: req.params.id }
+    if (userId) {
+      where.OR = [{ usuario_id: userId }, { usuario_id: null }]
+    }
     
-    const base = await prisma.bases_datos.findFirst({
-      where: { id: req.params.id, usuario_id: ownerId }
-    })
+    const base = await prisma.bases_datos.findFirst({ where })
     if (!base) return res.status(404).json({ error: 'Base no encontrada' })
     res.json({ success: true, base })
   } catch (e) {
@@ -2718,19 +2719,17 @@ app.get('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res) =
 
 app.post('/api/bases-datos', authOrSecret, requireLicense, async (req, res) => {
   try {
-    const ownerId = getOwnerId(req)
-    if (!ownerId) return res.status(401).json({ error: 'Usuario no identificado' })
-    
     const { nombre, color, contenido } = req.body
     if (!nombre?.trim() || !contenido?.trim()) {
       return res.status(400).json({ error: 'Nombre y contenido requeridos' })
     }
 
     const parsed = parsearNumeros(contenido)
+    const userId = req.user?.id || null
 
     const base = await prisma.bases_datos.create({
       data: {
-        usuario_id: ownerId,
+        usuario_id: userId,
         nombre: nombre.trim(),
         color: color || '#6366f1',
         contenido: parsed.limpio,
@@ -2748,13 +2747,16 @@ app.post('/api/bases-datos', authOrSecret, requireLicense, async (req, res) => {
 
 app.patch('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res) => {
   try {
-    const ownerId = getOwnerId(req)
-    if (!ownerId) return res.status(401).json({ error: 'Usuario no identificado' })
-    
+    const userId = req.user?.id || null
+    const { id } = req.params
     const { nombre, color, contenido } = req.body
-    const existing = await prisma.bases_datos.findFirst({
-      where: { id: req.params.id, usuario_id: ownerId }
-    })
+    
+    const where = { id }
+    if (userId) {
+      where.OR = [{ usuario_id: userId }, { usuario_id: null }]
+    }
+    
+    const existing = await prisma.bases_datos.findFirst({ where })
     if (!existing) return res.status(404).json({ error: 'Base no encontrada' })
 
     const updateData = {}
@@ -2768,7 +2770,7 @@ app.patch('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res)
     }
 
     const base = await prisma.bases_datos.update({
-      where: { id: req.params.id },
+      where: { id },
       data: updateData
     })
 
@@ -2780,20 +2782,24 @@ app.patch('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res)
 
 app.delete('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res) => {
   try {
-    const ownerId = getOwnerId(req)
-    if (!ownerId) return res.status(401).json({ error: 'Usuario no identificado' })
+    const userId = req.user?.id || null
+    const { id } = req.params
     
-    const existing = await prisma.bases_datos.findFirst({
-      where: { id: req.params.id, usuario_id: ownerId }
-    })
+    const where = { id }
+    if (userId) {
+      where.OR = [{ usuario_id: userId }, { usuario_id: null }]
+    }
+    
+    const existing = await prisma.bases_datos.findFirst({ where })
     if (!existing) return res.status(404).json({ error: 'Base no encontrada' })
 
-    await prisma.bases_datos.delete({ where: { id: req.params.id } })
+    await prisma.bases_datos.delete({ where: { id } })
     res.json({ success: true })
   } catch (e) {
     res.status(500).json({ error: e.message })
   }
 })
+
 
 cron.schedule('*/5 * * * *', async () => {
   try {
