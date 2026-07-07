@@ -397,20 +397,6 @@ async function requireLicense(req, res, next) {
       return res.status(403).json({ error: 'Licencia inválida o expirada' })
     }
 
-    // 🔐 Verificar instance_id en cada request (anti-clonación)
-        // 🔐 INSTANCE ID — permitir reemplazo para upgrades
-    const storedInstanceId = await prisma.app_config.findUnique({ where: { key: 'instance_id' } })
-    const jwtInstanceId = license.instance_id
-
-    if (jwtInstanceId) {
-      // Siempre actualizar instance_id (permite upgrades de licencia)
-      await prisma.app_config.upsert({
-        where: { key: 'instance_id' },
-        update: { value: jwtInstanceId },
-        create: { key: 'instance_id', value: jwtInstanceId }
-      })
-    }
-
     req.license = license
     next()
   } catch (e) {
@@ -2523,64 +2509,39 @@ app.post('/api/setup/activate', async (req, res) => {
     const license = validateLicense(licenseKey)
     if (!license) return res.status(400).json({ error: 'Licencia inválida' })
 
-    const instanceDomain = process.env.RAILWAY_STATIC_URL || process.env.VERCEL_URL || req.headers.host
+    // Anti-clonación: verificar dominio
+    const instanceDomain = process.env.RAILWAY_STATIC_URL ||
+                           process.env.VERCEL_URL ||
+                           req.headers.host
 
-    // Domain binding
     if (license.domain && license.domain !== instanceDomain) {
-      return res.status(403).json({ error: 'Licencia no válida para este dominio' })
+      return res.status(403).json({
+        error: 'Licencia no válida para este dominio',
+        licensedDomain: license.domain,
+        currentDomain: instanceDomain
+      })
     }
 
-    // 🔐 UN SOLO USO: verificar instance_id
-    const storedInstanceId = await prisma.app_config.findUnique({ where: { key: 'instance_id' } })
-    const jwtInstanceId = license.instance_id
-
-    if (jwtInstanceId) {
-      // Si ya hay una instancia guardada y no coincide → CLONACIÓN
-      if (storedInstanceId?.value && storedInstanceId.value !== jwtInstanceId) {
-        // 🚨 ALERTA: Alguien intentó usar esta licencia en otra instancia
-        await alertOwner('CLONACION_DETECTADA', {
-          licenseId: license.license_id,
-          email: license.email,
-          instanceId: jwtInstanceId,
-          domain: instanceDomain,
-          storedInstanceId: storedInstanceId.value
-        })
-        return res.status(403).json({
-          error: 'Licencia ya activada en otra instancia. Contactá soporte.',
-          code: 'LICENSE_BOUND_TO_OTHER_INSTANCE'
-        })
-      }
-      
-      // Primera activación: guardar instance_id
-      if (!storedInstanceId?.value) {
-        await prisma.app_config.upsert({
-          where: { key: 'instance_id' },
-          update: { value: jwtInstanceId },
-          create: { key: 'instance_id', value: jwtInstanceId }
-        })
-      }
-    }
-
-    // Guardar licencia
     await prisma.app_config.upsert({
       where: { key: 'license' },
       update: { value: licenseKey },
       create: { key: 'license', value: licenseKey }
     })
 
+    await prisma.app_config.upsert({
+      where: { key: 'instance_domain' },
+      update: { value: instanceDomain },
+      create: { key: 'instance_domain', value: instanceDomain }
+    })
+
+    // 🧹 Limpiar instance_id si quedó de versiones anteriores
+    await prisma.app_config.deleteMany({ where: { key: 'instance_id' } }).catch(() => {})
+
     tierCache = null
     tierCacheTime = 0
 
-    // 🟢 ALERTA: Activación exitosa (para tu registro)
-    await alertOwner('ACTIVACION_EXITOSA', {
-      licenseId: license.license_id,
-      email: license.email,
-      instanceId: jwtInstanceId,
-      domain: instanceDomain,
-      tier: license.tier
-    })
+    res.json({ success: true, tier: license.tier, features: license })
 
-    res.json({ success: true, tier: license.tier, instanceId: jwtInstanceId })
   } catch (e) {
     console.error('Setup activate error:', e)
     res.status(500).json({ error: 'Error activando licencia' })
