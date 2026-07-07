@@ -53,34 +53,49 @@ class WAService {
     this.lidCache.set(key, value)
   }
 
-  async init() {
+ async init() {
     console.log('✅ WabiSend WAService inicializado')
     try {
       const lines = await this.prisma.lineas_whatsapp.findMany({
         where: { status: 'CONECTADA' }
+      }).catch(e => {
+        console.error('⚠️ DB lineas_whatsapp no accesible (schema desfasado):', e.message)
+        return []
       })
       for (const line of lines) {
         if (line.phone) {
-          await this.connect(line.phone).catch(e => console.error(e))
+          await this.connect(line.phone).catch(e => console.error('Connect error:', e.message))
           await new Promise(r => setTimeout(r, 1500))
         }
       }
     } catch (e) {
-      console.error('Error init:', e)
+      console.error('Error init:', e.message)
     }
   }
 
-  async connect(phone) {
-  // 🔐 INLINE LICENSE CHECK
-  const licenseConfig = await this.prisma.app_config.findUnique({ where: { key: 'license' } })
-  if (!licenseConfig?.value) throw new Error('LICENSE_REQUIRED')
-  const license = validateLicense(licenseConfig.value)  // ← SIN this.
-  if (!license) throw new Error('LICENSE_INVALID')
-  
-  // Verificar límite de líneas según tier
-  const tierConfig = TIER_LIMITS[license.tier]  // ← TIER_LIMITS global del server.js
-  const activeLines = await this.prisma.lineas_whatsapp.count({ where: { status: 'CONECTADA' } })
-  if (activeLines >= tierConfig.maxLines) throw new Error('TIER_LINE_LIMIT')
+ async connect(phone) {
+    // 🔐 INLINE LICENSE CHECK (no fatal)
+    try {
+      const licenseConfig = await this.prisma.app_config.findUnique({ where: { key: 'license' } })
+      if (!licenseConfig?.value) {
+        console.log('⏳ Sin licencia activa, omitiendo connect WhatsApp')
+        return null
+      }
+      const license = validateLicense(licenseConfig.value)
+      if (!license) {
+        console.log('⏳ Licencia inválida, omitiendo connect WhatsApp')
+        return null
+      }
+      const tierConfig = TIER_LIMITS[license.tier]
+      const activeLines = await this.prisma.lineas_whatsapp.count({ where: { status: 'CONECTADA' } })
+      if (activeLines >= tierConfig.maxLines) {
+        console.log('⏳ Límite de líneas alcanzado')
+        return null
+      }
+    } catch (e) {
+      console.error('⚠️ Error chequeando licencia en connect:', e.message)
+      return null
+    }
   
   try {
     let line = await this.prisma.lineas_whatsapp.findUnique({ where: { phone } })
