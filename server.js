@@ -1487,34 +1487,45 @@ app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
 
 app.post('/api/campaigns/simulate', authOrSecret, async (req, res) => {
   try {
+    // 1. Validar licencia
     const licenseConfig = await prisma.app_config.findUnique({ where: { key: 'license' } })
     if (!licenseConfig?.value) return res.status(403).json({ error: 'LICENSE_REQUIRED' })
+    
     const license = validateLicense(licenseConfig.value)
     if (!license) return res.status(403).json({ error: 'LICENSE_INVALID' })
-    if (license.tier === 'starter') return res.status(403).json({ error: 'Simulacro requiere Pro o Business' })
+    
+    const tier = license.tier
+    if (tier === 'starter') {
+      return res.status(403).json({ error: 'Simulacro requiere Pro o Business' })
+    }
+
+    // 2. Validar body
     const { targets, line_ids, mode = 'lite' } = req.body
     if (!targets?.length) return res.status(400).json({ error: 'Agregá números' })
     if (!line_ids?.length) return res.status(400).json({ error: 'Seleccioná al menos una línea' })
-    let tier = req.user?.tier || 'starter'
-    if (!tier || tier === 'starter') {
-      const license = await prisma.app_config.findUnique({ where: { key: 'license' } })
-      if (license?.value) {
-        try {
-          const parsed = JSON.parse(license.value)
-          tier = parsed?.tier || 'starter'
-        } catch {
-          try {
-            const payload = JSON.parse(Buffer.from(license.value.split('.')[1], 'base64').toString())
-            tier = payload?.tier || 'starter'
-          } catch { tier = 'starter' }
-        }
-      }
+
+    // 3. Validar LÍNEAS según modo y tier (NO números)
+    // Lite: 1 línea máximo en Pro, ilimitadas en Business
+    // Full: ilimitadas líneas, solo Business
+    if (mode === 'full' && tier !== 'business') {
+      return res.status(403).json({ error: 'Simulacro Full requiere Business' })
     }
-    if (tier === 'starter') return res.status(403).json({ error: 'Simulacro requiere Pro o Business' })
-    if (mode === 'full' && tier !== 'business') return res.status(403).json({ error: 'Simulacro Full requiere Business' })
-    if (mode === 'lite' && targets.length > 1 && tier !== 'business') {
-      return res.status(403).json({ error: 'Simulacro Lite: máximo 1 número en Pro' })
+    if (mode === 'lite' && line_ids.length > 1 && tier !== 'business') {
+      return res.status(403).json({ error: 'Simulacro Lite: máximo 1 línea en Pro' })
     }
+
+    // 4. Validar que las líneas existan y estén conectadas
+    const lines = await prisma.lineas_whatsapp.findMany({
+      where: { id: { in: line_ids }, status: 'CONECTADA' }
+    })
+    if (lines.length === 0) {
+      return res.status(400).json({ error: 'Las líneas seleccionadas no están conectadas' })
+    }
+    if (mode === 'lite' && lines.length > 1 && tier !== 'business') {
+      return res.status(403).json({ error: 'Simulacro Lite: máximo 1 línea en Pro' })
+    }
+
+    // 5. Crear campaña simulada
     const campaign = await prisma.campaigns.create({
       data: {
         id: `sim_${Date.now()}`,
@@ -1530,6 +1541,7 @@ app.post('/api/campaigns/simulate', authOrSecret, async (req, res) => {
         owner_id: req.user?.id || null
       }
     })
+
     res.status(201).json({
       success: true,
       campaign: {
