@@ -1075,6 +1075,11 @@ app.post('/api/lineas/connect', authOrSecret, requireLicense, async (req, res) =
   if (!phone) return res.status(400).json({ error: 'phone required' })
   try {
     const line = await waService.connect(phone)
+    if (!line) {
+      return res.status(409).json({ 
+        error: 'La línea ya está conectándose o no hay licencia activa. Esperá unos segundos.' 
+      })
+    }
     res.json({ message: 'QR generado. Escanea desde el panel.', lineId: line.id })
   } catch (err) {
     console.error(err)
