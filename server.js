@@ -1076,10 +1076,10 @@ app.post('/api/lineas/connect', authOrSecret, requireLicense, async (req, res) =
   try {
     const line = await waService.connect(phone)
     if (!line) {
-      return res.status(409).json({ 
-        error: 'La línea ya está conectándose o no hay licencia activa. Esperá unos segundos.' 
-      })
-    }
+  return res.status(409).json({ 
+    error: 'No se pudo conectar la línea. Verificá que esté registrada o que no haya errores de sesión.' 
+  })
+}
     res.json({ message: 'QR generado. Escanea desde el panel.', lineId: line.id })
   } catch (err) {
     console.error(err)
@@ -3031,6 +3031,8 @@ process.on('SIGTERM', async () => {
   await prisma.$disconnect().catch(() => {})
   process.exit(0)
 })
+
+
 // ============================================================
 // SERVER START
 // ============================================================
