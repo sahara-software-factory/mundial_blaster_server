@@ -1166,6 +1166,18 @@ app.delete('/api/lineas/:id', authOrSecret, requireLicense, async (req, res) => 
   }
 })
 
+app.post('/api/lineas/stop', authOrSecret, requireLicense, async (req, res) => {
+  const { lineId } = req.body
+  if (!lineId) return res.status(400).json({ error: 'lineId required' })
+  try {
+    await waService.stopLine(lineId)
+    res.json({ success: true })
+  } catch (err) {
+    console.error('Error stop:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // ========== CAMPAÑAS ==========
 app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (req, res) => {
   try {
