@@ -464,7 +464,7 @@ class WAService {
                   update: { phone: realPhone, updatedAt: new Date() },
                   create: { lineId, lid: lidClean, phone: realPhone }
                 }).catch(() => {})
-                console.log(`🕵️‍♂️ LID mapeado por Acuse: ${lidClean} -> ${maskPhone(realPhone)}`)
+                // console.log(`🕵️‍♂️ LID mapeado por Acuse: ${lidClean} -> ${maskPhone(realPhone)}`)
               }
             } catch (e) {
               console.error("Error en Cazador de LIDs:", e)
@@ -548,7 +548,7 @@ class WAService {
       update: { phone, updatedAt: new Date() },
       create: { lineId, lid, phone }
     }).catch(() => {})
-    console.log(`🔗 LID mapeado: ${lid} → ${maskPhone(phone)} (línea ${lineId})`)
+    // console.log(`🔗 LID mapeado: ${lid} → ${maskPhone(phone)} (línea ${lineId})`)
   }
 
   async resolvePhoneFromJid(lineId, rawJid) {
@@ -657,7 +657,7 @@ class WAService {
   // 🔐 INLINE LICENSE CHECK
   const licenseConfig = await this.prisma.app_config.findUnique({ where: { key: 'license' } })
   if (!licenseConfig?.value) throw new Error('LICENSE_REQUIRED')
-  const license = validateLicense(licenseConfig.value)  // ← SIN this.
+  const license = this.validateLicense(licenseConfig.value)
   if (!license) throw new Error('LICENSE_INVALID')
   
   // Verificar tier para features avanzadas
