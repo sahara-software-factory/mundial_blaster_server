@@ -665,17 +665,23 @@ class WAService {
   if (options.imageUrl && license.tier === 'starter') throw new Error('TIER_UPGRADE_REQUIRED')
   
   const { delayMin = 8000, delayMax = 15000, imageUrl = null } = options
-  let lineasActivas = []
+    let lineasActivas = []
   if (Array.isArray(lineInput)) {
-    lineasActivas = lineInput.filter(l => l.status === 'CONECTADA' && this.clients.has(l.id))
+    lineasActivas = lineInput.filter(l => {
+      const client = this.clients.get(l.id)
+      return l.status === 'CONECTADA' && client && client.user
+    })
   } else if (typeof lineInput === 'string') {
     const line = await this.prisma.lineas_whatsapp.findUnique({ where: { id: lineInput } })
-    if (line && line.status === 'CONECTADA') lineasActivas = [line]
+    const client = line ? this.clients.get(line.id) : null
+    if (line && line.status === 'CONECTADA' && client && client.user) lineasActivas = [line]
   } else if (lineInput && lineInput.id) {
-    lineasActivas = [lineInput]
+    const client = this.clients.get(lineInput.id)
+    if (lineInput.status === 'CONECTADA' && client && client.user) lineasActivas = [lineInput]
   }
+  
   if (lineasActivas.length === 0) {
-    throw new Error('No hay líneas conectadas disponibles para enviar')
+    throw new Error('No hay líneas conectadas y autenticadas disponibles para enviar')
   }
   
   await this.prisma.campaigns.update({
