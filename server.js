@@ -1187,16 +1187,25 @@ app.post('/api/lineas/stop', authOrSecret, requireLicense, async (req, res) => {
 app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (req, res) => {
   try {
     const body = req.body
+    console.log('📨 CAMPAÑA RECIBIDA:', { 
+      schedule: body.schedule, 
+      execute_at: body.execute_at,
+      hasTargets: !!body.targets?.length,
+      hasLines: !!(body.line_ids?.length || body.line_id)
+    })
+
     if (!body.message || !body.message.trim()) {
       return res.status(400).json({ error: 'El mensaje es obligatorio' })
     }
     if (!body.targets || !Array.isArray(body.targets) || body.targets.length === 0) {
       return res.status(400).json({ error: 'Debes seleccionar al menos un contacto' })
     }
+
     const lineIds = body.line_ids || (body.line_id ? [body.line_id] : [])
     if (lineIds.length === 0) {
       return res.status(400).json({ error: 'Debes seleccionar al menos una línea' })
     }
+
     const lineasSeleccionadas = await prisma.lineas_whatsapp.findMany({
       where: { id: { in: lineIds }, status: 'CONECTADA' }
     })
@@ -1205,11 +1214,12 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
         error: 'Las líneas seleccionadas no están conectadas. Conectalas antes de enviar.'
       })
     }
-    const distributionMode = body.distribution_mode || 'single'
+
     const isPending = body.schedule === 'pending'
     const isScheduled = body.schedule === 'scheduled' && body.execute_at
     const isRoundRobin = body.distribution_mode === 'round_robin'
 
+    // Validaciones de tier
     if (isPending) {
       const userId = req.user?.id || null
       const pendingCount = await prisma.campaigns.count({
@@ -1246,17 +1256,19 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
         tier: req.tier,
       })
     }
+
     const allowedImageUrl = req.tierConfig?.hasTemplateVars ? body.image_url : null
+
     const newCampaign = await prisma.campaigns.create({
       data: {
         id: `camp_${Date.now()}`,
         name: body.name || `Campaña ${new Date().toLocaleDateString('es-AR')}`,
         message: body.message.trim(),
+        image_url: allowedImageUrl || body.image_url || null,
         total: body.targets.length,
         sent: 0,
-        image_url: allowedImageUrl || null,
         failed: 0,
-        status: 'pending',
+        status: 'pending', // ← siempre pending al crear, el cron o el start la cambian
         targets: body.targets,
         distribution_mode: isRoundRobin ? 'round_robin' : 'single',
         line_id: lineasSeleccionadas[0]?.id || '',
@@ -1268,6 +1280,9 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       }
     })
 
+    console.log('✅ Campaña creada:', newCampaign.id, 'schedule:', body.schedule)
+
+    // ─── GUARDAR EN ESPERA (pending) ───
     if (isPending) {
       return res.status(201).json({
         success: true,
@@ -1282,9 +1297,11 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       })
     }
 
+    // ─── PROGRAMAR (scheduled) ───
     if (isScheduled) {
       const executeAt = new Date(body.execute_at)
       const now = new Date()
+      
       if (isNaN(executeAt.getTime())) {
         return res.status(400).json({ error: 'Fecha de programación inválida' })
       }
@@ -1295,13 +1312,17 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
           serverTime: now.toISOString()
         })
       }
-      await prisma.scheduled_campaigns.create({
+
+      const scheduled = await prisma.scheduled_campaigns.create({
         data: {
           campaign_id: newCampaign.id,
           execute_at: executeAt,
           status: 'pending'
         }
       })
+
+      console.log('📅 Scheduled creado:', scheduled.id, 'para:', executeAt.toISOString())
+
       return res.status(201).json({
         success: true,
         campaign: {
@@ -1316,6 +1337,7 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       })
     }
 
+    // ─── ENVIAR AHORA (now) ───
     const sendOptions = {
       delayMin: body.delay_min || 8000,
       delayMax: body.delay_max || 15000,
@@ -1324,6 +1346,12 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       skipBlacklist: body.skipBlacklist === true,
       ownerId: req.user?.id || null
     }
+
+    // Actualizar a running antes de enviar
+    await prisma.campaigns.update({
+      where: { id: newCampaign.id },
+      data: { status: 'running' }
+    }).catch(() => {})
 
     waService.sendCampaign(newCampaign.id, lineasSeleccionadas, body.targets, body.message.trim(), sendOptions)
       .then(() => console.log(`✅ Campaña ${newCampaign.id} finalizada`))
@@ -1340,6 +1368,7 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
         lines: lineasSeleccionadas.map(l => ({ id: l.id, phone: l.phone, nombre: l.nombre }))
       }
     })
+
   } catch (e) {
     console.error('💥 Error creando campaña:', e)
     res.status(500).json({ error: 'Error creando campaña' })
@@ -2819,73 +2848,68 @@ app.delete('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res
 
 cron.schedule('*/5 * * * *', async () => {
   try {
-    // 🛑 Si el tier es Starter, no ejecutar cron
     const currentTier = await getAppTier()
-    if (currentTier === 'starter') return
+    if (currentTier === 'starter') {
+      console.log('⏰ Cron: Starter tier, no ejecutar')
+      return
+    }
 
-    // 🔄 Reconnect silencioso si Neon cerró la conexión
+    // Reconnect silencioso
     try {
       await prisma.$queryRaw`SELECT 1`
     } catch (connErr) {
       if (connErr.code === 'P1017') {
         await prisma.$disconnect()
         await prisma.$connect()
-        console.log('🔄 Prisma reconnected after timeout')
+        console.log('🔄 Prisma reconnected')
       }
-    }
-
-    // 🧹 RECOVERY: campañas atascadas en 'processing' por más de 30 min
-    const thirtyMinsAgo = new Date(Date.now() - 30 * 60 * 1000)
-    const stuck = await prisma.scheduled_campaigns.findMany({
-      where: {
-        status: 'processing',
-        createdAt: { lt: thirtyMinsAgo }
-      }
-    })
-    for (const s of stuck) {
-      console.log(`🧹 Recuperando campaña atascada: ${s.campaign_id}`)
-      await prisma.scheduled_campaigns.update({
-        where: { id: s.id },
-        data: { status: 'failed' }
-      }).catch(() => {})
-      await prisma.campaigns.update({
-        where: { id: s.campaign_id },
-        data: { status: 'failed' }
-      }).catch(() => {})
     }
 
     const now = new Date()
     const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000)
+
+    // Buscar scheduled pendientes que ya deberían ejecutarse
     const pending = await prisma.scheduled_campaigns.findMany({
       where: {
         status: 'pending',
-        execute_at: {
-          lte: now,
-          gte: oneHourAgo
-        }
+        execute_at: { lte: now, gte: oneHourAgo }
       },
       orderBy: { execute_at: 'asc' }
     })
-    
-    if (pending.length === 0) return
-    console.log(`⏰ ${pending.length} campaña(s) programada(s) lista(s) para ejecutar`)
+
+    if (pending.length === 0) {
+      console.log('⏰ Cron: No hay campañas programadas pendientes')
+      return
+    }
+
+    console.log(`⏰ Cron: ${pending.length} campaña(s) lista(s) para ejecutar`)
 
     for (const sched of pending) {
-      try {
-        const campaign = await prisma.campaigns.findUnique({
-          where: { id: sched.campaign_id }
-        })
-        if (!campaign || campaign.status !== 'pending') {
-          console.log(`⏭️ Campaña ${sched.campaign_id} no está en pending, saltando`)
-          continue
-        }
+      console.log(`🔄 Procesando scheduled ${sched.id} → campaign ${sched.campaign_id}`)
 
-        // Marcar como processing
+      try {
+        // Marcar como processing INMEDIATAMENTE
         await prisma.scheduled_campaigns.update({
           where: { id: sched.id },
           data: { status: 'processing' }
         })
 
+        const campaign = await prisma.campaigns.findUnique({
+          where: { id: sched.campaign_id }
+        })
+
+        if (!campaign) {
+          console.error(`❌ Campaña ${sched.campaign_id} no existe`)
+          await prisma.scheduled_campaigns.update({
+            where: { id: sched.id },
+            data: { status: 'failed' }
+          })
+          continue
+        }
+
+        console.log(`📋 Campaña ${campaign.id}: status=${campaign.status}, total=${campaign.total}`)
+
+        // Extraer líneas
         let lineIds = []
         try {
           if (campaign.selected_lines) lineIds = JSON.parse(campaign.selected_lines)
@@ -2895,20 +2919,15 @@ cron.schedule('*/5 * * * *', async () => {
         const lineasSeleccionadas = await prisma.lineas_whatsapp.findMany({
           where: { id: { in: lineIds }, status: 'CONECTADA' }
         })
-        
+
         if (lineasSeleccionadas.length === 0) {
-          console.log(`❌ No hay líneas conectadas para campaña ${campaign.id}`)
-          await prisma.scheduled_campaigns.update({
-            where: { id: sched.id },
-            data: { status: 'failed' }
-          })
-          await prisma.campaigns.update({
-            where: { id: campaign.id },
-            data: { status: 'failed' }
-          })
+          console.error(`❌ No hay líneas conectadas para campaña ${campaign.id}`)
+          await prisma.scheduled_campaigns.update({ where: { id: sched.id }, data: { status: 'failed' } })
+          await prisma.campaigns.update({ where: { id: campaign.id }, data: { status: 'failed' } })
           continue
         }
 
+        // Parsear targets
         let parsedTargets = []
         try {
           parsedTargets = typeof campaign.targets === 'string' 
@@ -2916,10 +2935,7 @@ cron.schedule('*/5 * * * *', async () => {
             : campaign.targets
         } catch (e) {
           console.error('Error parseando targets:', e)
-          await prisma.scheduled_campaigns.update({
-            where: { id: sched.id },
-            data: { status: 'failed' }
-          })
+          await prisma.scheduled_campaigns.update({ where: { id: sched.id }, data: { status: 'failed' } })
           continue
         }
 
@@ -2929,7 +2945,7 @@ cron.schedule('*/5 * * * *', async () => {
           data: { status: 'running' }
         })
 
-        // 🔥 EJECUTAR CON TIMEOUT DE 15 MINUTOS
+        // EJECUTAR CON TIMEOUT
         const CAMPAIGN_TIMEOUT_MS = 15 * 60 * 1000
         
         const sendPromise = waService.sendCampaign(
@@ -2971,7 +2987,7 @@ cron.schedule('*/5 * * * *', async () => {
         }
 
       } catch (loopErr) {
-        console.error(`❌ Error procesando scheduled ${sched.id}:`, loopErr)
+        console.error(`❌ Error en scheduled ${sched.id}:`, loopErr)
         await prisma.scheduled_campaigns.update({
           where: { id: sched.id },
           data: { status: 'failed' }
@@ -2979,7 +2995,7 @@ cron.schedule('*/5 * * * *', async () => {
       }
     }
   } catch (e) {
-    console.error('⏰ Error cron scheduled campaigns:', e)
+    console.error('⏰ Error cron:', e)
   }
 })
 
