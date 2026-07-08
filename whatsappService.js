@@ -75,9 +75,8 @@ class WAService {
     }
   }
 
- async connect(phone) {
+async connect(phone) {
   try {
-    // 1. Buscar línea una sola vez
     const line = await this.prisma.lineas_whatsapp.findUnique({ where: { phone } })
     if (!line) {
       console.warn(`⚠️ Línea no registrada: ${maskPhone(phone)}`)
@@ -86,85 +85,65 @@ class WAService {
     
     const lineId = line.id
     
-    // 2. Limpiar flag de cancelación si existe (nuevo intento manual)
+    // Limpiar flag de cancelación
     if (this.reconnectTimers[lineId] === 'CANCELLED') {
       delete this.reconnectTimers[lineId]
-      console.log(`🧹 Flag CANCELLED limpiado para ${lineId.slice(0,8)}`)
     }
     
-    // 3. Anti-duplicado: si ya hay socket activo, no crear otro
-    if (this.clients.has(lineId)) {
-      console.log(`⏳ Línea ${lineId.slice(0,8)} ya conectándose...`)
-      return null
-    }
-    
-    // 4. Limpiar timer de reconexión pendiente
+    // 🧹 LIMPIAR TODO antes de crear nuevo socket
     if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] === 'number') {
       clearTimeout(this.reconnectTimers[lineId])
       delete this.reconnectTimers[lineId]
     }
+    if (this.presenceIntervals[lineId]) {
+      clearInterval(this.presenceIntervals[lineId])
+      delete this.presenceIntervals[lineId]
+    }
+    const existing = this.clients.get(lineId)
+    if (existing) {
+      try { 
+        existing.ws?.close() 
+        existing.ev?.removeAllListeners()
+      } catch (e) {}
+      this.clients.delete(lineId)
+      await new Promise(r => setTimeout(r, 500)) // Esperar a que se libere
+    }
     
-    // 5. INLINE LICENSE CHECK (no fatal)
+    // License check
     const licenseConfig = await this.prisma.app_config.findUnique({ where: { key: 'license' } })
     if (!licenseConfig?.value) {
-      console.log('⏳ Sin licencia activa, omitiendo connect WhatsApp')
+      console.log('⏳ Sin licencia activa')
       return null
     }
     const license = this.validateLicense(licenseConfig.value)
     if (!license) {
-      console.log('⏳ Licencia inválida, omitiendo connect WhatsApp')
+      console.log('⏳ Licencia inválida')
       return null
     }
     const tierConfig = this.tierLimits[license.tier]
     if (!tierConfig) {
-      console.log('⏳ Tier no encontrado, omitiendo connect')
+      console.log('⏳ Tier no encontrado')
       return null
     }
+    
+    // Contar líneas conectadas (excluyendo esta para permitir reconexión)
     const activeLines = await this.prisma.lineas_whatsapp.count({
-  where: {
-    status: 'CONECTADA',
-    id: { not: lineId }   // ← la clave
-  }
-})
-if (activeLines >= tierConfig.maxLines) {
+      where: { status: 'CONECTADA', id: { not: lineId } }
+    })
+    if (activeLines >= tierConfig.maxLines) {
       console.log('⏳ Límite de líneas alcanzado')
       return null
     }
     
-    // 6. Preparar sesión
+    // Preparar sesión
     const ownerId = line.owner_id || null
     this.lineOwners.set(lineId, ownerId)
     const sessionPath = path.join(this.sessionsDir, String(lineId))
-    
-    // Cerrar socket previo si existe (por si quedó colgado)
-    const existing = this.clients.get(lineId)
-    if (existing) {
-      try { existing.ws?.close() } catch {}
-      this.clients.delete(lineId)
-    }
-    
     await fs.ensureDir(sessionPath)
-    let state, saveCreds
-try {
-  const auth = await useMultiFileAuthState(sessionPath)
-  state = auth.state
-  saveCreds = auth.saveCreds
-} catch (e) {
-  console.warn(`⚠️ Sesión corrupta en ${lineId.slice(0,8)}, limpiando y reiniciando con QR...`)
-  await fs.remove(sessionPath).catch(() => {})
-  await fs.ensureDir(sessionPath)
-  await this.prisma.lineas_whatsapp.update({
-    where: { id: lineId },
-    data: { status: 'DESCONECTADA' }
-  }).catch(() => {})
-  const auth = await useMultiFileAuthState(sessionPath)
-  state = auth.state
-  saveCreds = auth.saveCreds
-  // Va a generar QR porque la sesión es nueva — comportamiento correcto
-}
+    
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath)
     const { version } = await fetchLatestBaileysVersion()
     
-    // 7. Crear socket Baileys
     const waClient = makeWASocket({
       version,
       logger,
@@ -175,9 +154,7 @@ try {
       },
       browser: ['WabiSend', 'Chrome', '120.0.0'],
       msgRetryCounterCache: this.msgRetryCounterCache,
-      getMessage: async (key) => {
-        return { conversation: 'WabiSend' }
-      },
+      getMessage: async (key) => ({ conversation: 'WabiSend' }),
       markOnlineOnConnect: false,
       syncFullHistory: false,
       connectTimeoutMs: 60000,
@@ -249,14 +226,24 @@ try {
         }).catch(() => {})
         return
       }
-      if (connection === 'close') {
+       if (connection === 'close') {
+        // Limpiar presencia
         if (this.presenceIntervals[lineId]) {
           clearInterval(this.presenceIntervals[lineId])
           delete this.presenceIntervals[lineId]
         }
+        
         const statusCode = lastDisconnect?.error?.output?.statusCode
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut
         console.log(`❌ Desconectado ${lineId}. Razón: ${statusCode}`)
+        
+        // 🚩 SI FUE CANCELADO, NO HACER NADA MÁS
+        if (this.reconnectTimers[lineId] === 'CANCELLED') {
+          console.log(`⏹️ Reconexión bloqueada para ${lineId} (cancelado por usuario)`)
+          this.clients.delete(lineId)
+          return
+        }
+        
         if (statusCode === 401) {
           console.log(`🔒 Sesión invalidada (401). Requiere reescanear QR.`)
           await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
@@ -265,8 +252,59 @@ try {
             where: { id: lineId },
             data: { status: 'DESCONECTADA' }
           }).catch(() => {})
-                    const ownerId = this.lineOwners.get(lineId)
+          const ownerId = this.lineOwners.get(lineId)
           const payload = { lineId, status: 'DESCONECTADA', reason: 'SESSION_INVALID', phone: maskPhone(phone) }
+          if (ownerId && this.io.emitToUser) {
+            this.io.emitToUser(ownerId, 'status', payload)
+          } else {
+            this.io.emit('status', payload)
+          }
+          return
+        }
+        
+        if (shouldReconnect) {
+          // Actualizar DB a DESCONECTADA mientras reconecta
+          await this.prisma.lineas_whatsapp.update({
+            where: { id: lineId },
+            data: { status: 'DESCONECTADA' }
+          }).catch(() => {})
+          
+          const ownerId = this.lineOwners.get(lineId)
+          const payload = { lineId, status: 'DESCONECTADA', reason: 'RECONNECTING' }
+          if (ownerId && this.io.emitToUser) {
+            this.io.emitToUser(ownerId, 'status', payload)
+          } else {
+            this.io.emit('status', payload)
+          }
+
+          if (this.reconnectTimers[lineId]) clearTimeout(this.reconnectTimers[lineId])
+          let delay = 5000
+          if (statusCode === 503 || statusCode === 428 || statusCode === 515) {
+            delay = 15000
+          } else if (statusCode === 408) {
+            delay = 8000
+          } else if (statusCode === 440) {
+            delay = 10000
+          }
+          console.log(`⏳ Reconectando ${lineId} en ${delay / 1000}s...`)
+          this.reconnectTimers[lineId] = setTimeout(async () => {
+            try {
+              this.clients.delete(lineId)
+              await this.connect(phone)
+            } catch (e) {
+              console.error(`❌ Falló reconexión ${lineId}:`, e)
+            }
+          }, delay)
+        } else {
+          console.log(`⚠️ Logout permanente ${lineId}`)
+          await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
+          this.clients.delete(lineId)
+          await this.prisma.lineas_whatsapp.update({
+            where: { id: lineId },
+            data: { status: 'DESCONECTADA' }
+          }).catch(() => {})
+          const ownerId = this.lineOwners.get(lineId)
+          const payload = { lineId, status: 'DESCONECTADA', reason: 'LOGOUT' }
           if (ownerId && this.io.emitToUser) {
             this.io.emitToUser(ownerId, 'status', payload)
           } else {
