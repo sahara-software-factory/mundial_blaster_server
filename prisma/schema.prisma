@@ -125,6 +125,8 @@ model scheduled_campaigns {
   execute_at  DateTime
   status      String   @default("pending")
   createdAt   DateTime @default(now())
+  attempts    Int      @default(0)
+  error       String?
 
   owner_id    String?
   owner       usuarios? @relation(fields: [owner_id], references: [id], onDelete: SetNull)
@@ -305,3 +307,4 @@ model bases_datos {
 
   @@index([usuario_id])
 }
+

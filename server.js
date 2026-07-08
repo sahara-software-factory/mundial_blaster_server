@@ -8,6 +8,7 @@ const { WAService } = require('./whatsappService')
 const jwt = require('jsonwebtoken')
 const bcrypt = require('bcryptjs')
 const cron = require('node-cron')
+const { DateTime } = require('luxon')
 const crypto = require('crypto')
 
 // Seguridad: npm install helmet express-rate-limit
@@ -112,6 +113,13 @@ io.emitToUser = (userId, event, payload) => {
     io.to(`user:${userId}`).emit(event, payload)
   }
 }
+
+const logNow = () => {
+  const utc = DateTime.now().toUTC()
+  const local = DateTime.now().setZone('America/Argentina/Buenos_Aires') // o tu zona
+  return { utc: utc.toISO(), local: local.toISO(), localShort: local.toFormat('yyyy-MM-dd HH:mm:ss') }
+}
+
 
 // Headers de seguridad
 app.use(helmet())
@@ -1317,7 +1325,8 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
 
     // ─── PROGRAMAR (scheduled) ───
     if (isScheduled) {
-      const executeAt = new Date(body.execute_at)
+      const { DateTime } = require('luxon')
+const executeAt = DateTime.fromISO(body.execute_at, { zone: 'America/Argentina/Buenos_Aires' }).toUTC().toJSDate()
       const now = new Date()
       
       if (isNaN(executeAt.getTime())) {
@@ -1564,6 +1573,29 @@ app.get('/api/campaigns/report', authOrSecret, loadTier, async (req, res) => {
   } catch (e) {
     console.error('Error reportes:', e)
     res.status(500).json({ error: 'Error generando reportes' })
+  }
+})
+
+app.get('/api/campaigns/scheduled/debug', authOrSecret, async (req, res) => {
+  try {
+    const now = new Date()
+    const pending = await prisma.scheduled_campaigns.findMany({
+      where: { status: { in: ['pending', 'processing'] } },
+      orderBy: { execute_at: 'asc' }
+    })
+    const lines = await prisma.lineas_whatsapp.findMany({
+      select: { id: true, phone: true, status: true, owner_id: true }
+    })
+    res.json({
+      serverTime: now.toISOString(),
+      pendingCampaigns: pending,
+      lines: lines.map(l => ({
+        ...l,
+        socketAlive: !!waService.clients.get(l.id)?.user
+      }))
+    })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
   }
 })
 
@@ -2865,56 +2897,50 @@ app.delete('/api/bases-datos/:id', authOrSecret, requireLicense, async (req, res
 
 
 cron.schedule('*/5 * * * *', async () => {
+  const { utc, localShort } = logNow()
+  console.log(`\n⏰ CRON START | Server: ${localShort} | UTC: ${utc}`)
+
   try {
-    const currentTier = await getAppTier()
-    if (currentTier === 'starter') {
-      console.log('⏰ Cron: Starter tier, no ejecutar')
-      return
-    }
-
-    // Reconnect silencioso
+    // 1. Reconectar líneas que deberían estar vivas (Railway deploy las mata)
     try {
-      await prisma.$queryRaw`SELECT 1`
-    } catch (connErr) {
-      if (connErr.code === 'P1017') {
-        await prisma.$disconnect()
-        await prisma.$connect()
-        console.log('🔄 Prisma reconnected')
-      }
+      await waService.init()
+      console.log('🔌 Init ejecutado, líneas reconectadas si era necesario')
+    } catch (initErr) {
+      console.error('⚠️ Init falló (no crítico):', initErr.message)
     }
 
+    // 2. Buscar campañas pendientes + colgadas (processing hace > 20 min)
     const now = new Date()
-    
-    // Buscar TODAS las scheduled pendientes que ya deberían ejecutarse
-    // (sin límite de oneHourAgo, que puede causar desfases)
+    const twentyMinAgo = new Date(now.getTime() - 20 * 60 * 1000)
+
     const pending = await prisma.scheduled_campaigns.findMany({
       where: {
-        status: 'pending',
-        execute_at: { lte: now }
+        OR: [
+          { status: 'pending', execute_at: { lte: now } },
+          { status: 'processing', execute_at: { lte: twentyMinAgo } } // colgadas por redeploy
+        ]
       },
       orderBy: { execute_at: 'asc' }
     })
 
-    console.log(`⏰ Cron check: now=${now.toISOString()}, encontradas=${pending.length} campañas`)
+    console.log(`📊 Campañas elegibles: ${pending.length} (pending + colgadas)`)
     for (const p of pending) {
-      console.log(`  📋 scheduled ${p.id}: execute_at=${p.execute_at.toISOString()}, status=${p.status}`)
+      console.log(`   - ${p.id} | camp:${p.campaign_id} | status:${p.status} | execute_at:${p.execute_at.toISOString()}`)
     }
 
     if (pending.length === 0) {
-      console.log('⏰ Cron: No hay campañas programadas pendientes')
+      console.log('⏰ Nada que ejecutar.\n')
       return
     }
 
-    console.log(`⏰ Cron: ${pending.length} campaña(s) lista(s) para ejecutar`)
-
     for (const sched of pending) {
-      console.log(`🔄 Procesando scheduled ${sched.id} → campaign ${sched.campaign_id}`)
+      console.log(`\n🚀 Procesando scheduled ${sched.id} → campaign ${sched.campaign_id}`)
 
       try {
         // Marcar como processing INMEDIATAMENTE
         await prisma.scheduled_campaigns.update({
           where: { id: sched.id },
-          data: { status: 'processing' }
+          data: { status: 'processing', attempts: { increment: 1 } }
         })
 
         const campaign = await prisma.campaigns.findUnique({
@@ -2922,106 +2948,128 @@ cron.schedule('*/5 * * * *', async () => {
         })
 
         if (!campaign) {
-          console.error(`❌ Campaña ${sched.campaign_id} no existe`)
-          await prisma.scheduled_campaigns.update({
-            where: { id: sched.id },
-            data: { status: 'failed' }
-          })
+          console.error(`❌ Campaña ${sched.campaign_id} no existe en DB`)
+          await prisma.scheduled_campaigns.update({ where: { id: sched.id }, data: { status: 'failed' } })
           continue
         }
 
-        console.log(`📋 Campaña ${campaign.id}: status=${campaign.status}, total=${campaign.total}`)
+        console.log(`   📋 Campaña: ${campaign.id} | total:${campaign.total} | msg:${campaign.message?.slice(0,40)}...`)
 
-        // Extraer líneas
+        // ─── TARGETS (defensivo) ───
+        let parsedTargets = []
+        try {
+          const raw = campaign.targets
+          if (raw == null) {
+            throw new Error('campaign.targets es null')
+          } else if (typeof raw === 'string') {
+            parsedTargets = JSON.parse(raw)
+          } else if (Array.isArray(raw)) {
+            parsedTargets = raw
+          } else {
+            throw new Error(`campaign.targets tipo inesperado: ${typeof raw}`)
+          }
+          if (!Array.isArray(parsedTargets) || parsedTargets.length === 0) {
+            throw new Error('campaign.targets array vacío')
+          }
+          console.log(`   🎯 Targets: ${parsedTargets.length} contactos`)
+        } catch (e) {
+          console.error(`❌ Error targets campaña ${campaign.id}:`, e.message)
+          await prisma.scheduled_campaigns.update({ where: { id: sched.id }, data: { status: 'failed', error: `TARGETS: ${e.message}` } })
+          await prisma.campaigns.update({ where: { id: campaign.id }, data: { status: 'failed' } })
+          continue
+        }
+
+        // ─── LÍNEAS (reconectar si es necesario) ───
         let lineIds = []
         try {
           if (campaign.selected_lines) lineIds = JSON.parse(campaign.selected_lines)
         } catch (e) {}
         if (lineIds.length === 0 && campaign.line_id) lineIds = [campaign.line_id]
 
-        const lineasSeleccionadas = await prisma.lineas_whatsapp.findMany({
-          where: { id: { in: lineIds }, status: 'CONECTADA' }
-        })
+        console.log(`   🔌 Buscando líneas: ${lineIds.join(', ') || 'NINGUNA'}`)
 
+        // Verificar sockets activos, no solo DB status
+        let lineasSeleccionadas = []
+        for (const lid of lineIds) {
+          const line = await prisma.lineas_whatsapp.findUnique({ where: { id: lid } })
+          const socketAlive = line ? waService.clients.get(line.id)?.user : null
+          if (line && socketAlive) {
+            lineasSeleccionadas.push(line)
+            console.log(`      ✅ Línea ${line.phone} CONECTADA (socket vivo)`)
+          } else if (line) {
+            console.log(`      ⚠️ Línea ${line.phone} status=${line.status} pero socket MUERTO`)
+          }
+        }
+
+        // Si no hay líneas vivas, NO fallar. Reintentar en próximo ciclo (5 min).
         if (lineasSeleccionadas.length === 0) {
-          console.error(`❌ No hay líneas conectadas para campaña ${campaign.id}`)
-          await prisma.scheduled_campaigns.update({ where: { id: sched.id }, data: { status: 'failed' } })
-          await prisma.campaigns.update({ where: { id: campaign.id }, data: { status: 'failed' } })
+          console.log(`   ⏳ SIN LÍNEAS VIVAS. Reintentando en próximo ciclo (5 min).`)
+          // Volver a pending para reintentar (máximo 3 intentos)
+          const attempts = (sched.attempts || 0) + 1
+          if (attempts >= 3) {
+            console.log(`   ❌ Máximo reintentos alcanzado (3). Marcando failed.`)
+            await prisma.scheduled_campaigns.update({
+              where: { id: sched.id },
+              data: { status: 'failed', error: 'Sin líneas conectadas tras 3 intentos' }
+            })
+            await prisma.campaigns.update({ where: { id: campaign.id }, data: { status: 'failed' } })
+          } else {
+            await prisma.scheduled_campaigns.update({
+              where: { id: sched.id },
+              data: { status: 'pending', error: `Reintento ${attempts}/3: sin líneas` }
+            })
+            console.log(`   🔄 Reprogramado como pending (intento ${attempts}/3)`)
+          }
           continue
         }
 
-        // Parsear targets
-        let parsedTargets = []
-        try {
-          parsedTargets = typeof campaign.targets === 'string' 
-            ? JSON.parse(campaign.targets) 
-            : campaign.targets
-        } catch (e) {
-          console.error('Error parseando targets:', e)
-          await prisma.scheduled_campaigns.update({ where: { id: sched.id }, data: { status: 'failed' } })
-          continue
-        }
-
-        // Actualizar campaña a running
+        // ─── EJECUTAR ───
         await prisma.campaigns.update({
           where: { id: campaign.id },
           data: { status: 'running' }
         })
 
-        // EJECUTAR CON TIMEOUT
-        const CAMPAIGN_TIMEOUT_MS = 15 * 60 * 1000
-        
-        const sendPromise = waService.sendCampaign(
+        const sendOptions = {
+          delayMin: 5000,
+          delayMax: 12000,
+          imageUrl: campaign.image_url,
+          humanMode: campaign.human_mode === true,
+          skipBlacklist: true,
+          ownerId: campaign.owner_id || null
+        }
+
+        console.log(`   📤 Enviando campaña...`)
+        await waService.sendCampaign(
           campaign.id,
           lineasSeleccionadas,
           parsedTargets,
           campaign.message,
-          {
-            delayMin: 5000,
-            delayMax: 12000,
-            imageUrl: campaign.image_url,
-            humanMode: campaign.human_mode === true,
-            skipBlacklist: true,
-            ownerId: campaign.owner_id || null
-          }
+          sendOptions
         )
-        
-        const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => reject(new Error('CAMPAIGN_TIMEOUT')), CAMPAIGN_TIMEOUT_MS)
-        })
 
-        try {
-          await Promise.race([sendPromise, timeoutPromise])
-          console.log(`✅ Campaña ${campaign.id} completada`)
-          await prisma.scheduled_campaigns.update({
-            where: { id: sched.id },
-            data: { status: 'completed' }
-          })
-        } catch (err) {
-          console.error(`❌ Campaña ${campaign.id} falló:`, err.message)
-          await prisma.scheduled_campaigns.update({
-            where: { id: sched.id },
-            data: { status: 'failed' }
-          })
-          await prisma.campaigns.update({
-            where: { id: campaign.id },
-            data: { status: 'failed' }
-          })
-        }
-
-      } catch (loopErr) {
-        console.error(`❌ Error en scheduled ${sched.id}:`, loopErr)
+        console.log(`   ✅ Campaña ${campaign.id} completada`)
         await prisma.scheduled_campaigns.update({
           where: { id: sched.id },
+          data: { status: 'completed', error: null }
+        })
+
+      } catch (err) {
+        console.error(`   ❌ Error ejecutando scheduled ${sched.id}:`, err.message)
+        await prisma.scheduled_campaigns.update({
+          where: { id: sched.id },
+          data: { status: 'failed', error: err.message?.slice(0, 500) }
+        }).catch(() => {})
+        await prisma.campaigns.update({
+          where: { id: sched.campaign_id },
           data: { status: 'failed' }
         }).catch(() => {})
       }
     }
   } catch (e) {
-    console.error('⏰ Error cron:', e)
+    console.error('⏰ Error global cron:', e)
   }
+  console.log(`⏰ CRON END\n`)
 })
-
 
 async function alertOwner(type, data) {
   const WEBHOOK = process.env.ALERT_WEBHOOK
