@@ -43,6 +43,7 @@ class WAService {
     this.msgRetryCounterCache = new NodeCache()
     this.lidCache = new Map()
     this.lineOwners = new Map()
+    this.sessionHealth = new Map()
     this.maxLidCacheSize = 5000
     fs.ensureDirSync(this.sessionsDir)
   }
@@ -142,6 +143,16 @@ async connect(phone) {
 
   // ─── QR ───
   if (qr) {
+
+     const health = this.sessionHealth.get(lineId)
+    if (health?.lastOpen && (Date.now() - health.lastOpen.getTime() < 60000)) {
+        console.log(`🧹 Sesión corrupta detectada (QR < 60s después de open). Limpiando ${lineId}`)
+        await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
+        this.sessionHealth.delete(lineId)
+        this.clients.delete(lineId)
+        // No emitir QR al frontend, forzar reconexión limpia
+        return
+    }
     try {
       const qrDataUrl = await QRCode.toDataURL(qr)
       const ownerId = this.lineOwners.get(lineId)
@@ -164,6 +175,7 @@ async connect(phone) {
   // ─── CONECTADO ───
   if (connection === 'open') {
     console.log(`✅ Conectado: ${lineId}`)
+    this.sessionHealth.set(lineId, { lastOpen: new Date(), qrAfterOpen: false })
     
     if (this.reconnectTimers[lineId]) {
       clearTimeout(this.reconnectTimers[lineId])

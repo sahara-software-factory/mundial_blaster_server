@@ -3,6 +3,8 @@ require('dotenv').config()
 const express = require('express')
 const http = require('http')
 const { Server } = require('socket.io')
+const fs = require('fs-extra')
+const path = require('path')
 const { PrismaClient } = require('@prisma/client')
 const { WAService } = require('./whatsappService')
 const jwt = require('jsonwebtoken')
@@ -1079,15 +1081,37 @@ app.patch('/api/templates/:id/favorite', authOrSecret, loadTier, requireFeature(
 
 // ========== LÍNEAS ==========
 app.post('/api/lineas/connect', authOrSecret, requireLicense, async (req, res) => {
-  const { phone } = req.body
+  const { phone, force } = req.body
   if (!phone) return res.status(400).json({ error: 'phone required' })
+  
   try {
+    // Si el usuario fuerza (desde el modal), limpiar sesión corrupta primero
+    if (force === true) {
+      const line = await prisma.lineas_whatsapp.findUnique({ where: { phone } })
+      if (line) {
+        const sessionPath = path.join('/app/sessions', String(line.id))
+        await fs.remove(sessionPath).catch(() => {})
+        // Matar socket zombie si existe
+        const existing = waService.clients.get(line.id)
+        if (existing) {
+          try { existing.ws?.close() } catch {}
+          waService.clients.delete(line.id)
+        }
+        // Limpiar timers
+        if (waService.reconnectTimers[line.id]) {
+          clearTimeout(waService.reconnectTimers[line.id])
+          delete waService.reconnectTimers[line.id]
+        }
+        console.log(`🧹 Sesión forzada limpiada: ${line.id}`)
+      }
+    }
+
     const line = await waService.connect(phone)
     if (!line) {
-  return res.status(409).json({ 
-    error: 'No se pudo conectar la línea. Verificá que esté registrada o que no haya errores de sesión.' 
-  })
-}
+      return res.status(409).json({ 
+        error: 'No se pudo conectar la línea. Verificá que esté registrada o que no haya errores de sesión.' 
+      })
+    }
     res.json({ message: 'QR generado. Escanea desde el panel.', lineId: line.id })
   } catch (err) {
     console.error(err)
@@ -3085,19 +3109,50 @@ async function alertOwner(type, data) {
   } catch (e) { /* Silencioso. Nunca falla. */ }
 }
 
-// Agregar cerca del final de server.js, antes del server.listen:
-process.on('SIGTERM', async () => {
-  console.log('🔴 SIGTERM: cerrando sockets Baileys...')
-  for (const [, client] of waService.clients.entries()) {
-    try { client.ws?.close() } catch {}
+// Graceful shutdown: cerrar sockets Baileys antes de morir
+async function gracefulShutdown(signal) {
+  console.log(`\n🛑 ${signal} recibido. Cerrando ${waService.clients.size} sockets...`)
+  
+  const closePromises = []
+  for (const [lineId, client] of waService.clients.entries()) {
+    closePromises.push(
+      new Promise((resolve) => {
+        try {
+          client.ws?.close()
+          // Darle 2 segundos a Baileys para guardar credenciales
+          setTimeout(resolve, 2000)
+        } catch (e) {
+          resolve()
+        }
+      })
+    )
   }
-  waService.clients.clear()
-  // 2 segundos para que los archivos de sesión terminen de flushearse al Volume
-  await new Promise(r => setTimeout(r, 2000))
-  await prisma.$disconnect().catch(() => {})
-  process.exit(0)
-})
+  
+  await Promise.all(closePromises)
+  
+  // Limpiar timers
+  for (const [lineId, timer] of Object.entries(waService.reconnectTimers)) {
+    if (typeof timer === 'number') clearTimeout(timer)
+  }
+  for (const [lineId, interval] of Object.entries(waService.presenceIntervals)) {
+    if (typeof interval === 'number') clearInterval(interval)
+  }
+  
+  await prisma.$disconnect()
+  server.close(() => {
+    console.log('✅ Servidor cerrado gracefulmente')
+    process.exit(0)
+  })
+  
+  // Fallback si algo se cuelga
+  setTimeout(() => {
+    console.log('⚠️ Forzando salida después de 10s')
+    process.exit(0)
+  }, 10000)
+}
 
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.on('SIGINT', () => gracefulShutdown('SIGINT'))
 
 // ============================================================
 // SERVER START
