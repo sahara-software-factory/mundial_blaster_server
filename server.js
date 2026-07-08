@@ -3151,7 +3151,7 @@ async function gracefulShutdown(signal) {
   }, 10000)
 }
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
 process.on('SIGINT', () => gracefulShutdown('SIGINT'))
 
 // ============================================================
