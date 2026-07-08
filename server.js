@@ -438,7 +438,7 @@ async function requireLicense(req, res, next) {
 // WHATSAPP SERVICE
 // ============================================================
 const waService = new WAService(prisma, io, validateLicense, TIER_LIMITS)
-waService.init()
+waService.init().catch(e => console.error('Init error:', e))
 
 io.on('connection', () => console.log('🟢 Socket conectado'))
 
@@ -1256,14 +1256,32 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       return res.status(400).json({ error: 'Debes seleccionar al menos una línea' })
     }
 
-    const lineasSeleccionadas = await prisma.lineas_whatsapp.findMany({
-      where: { id: { in: lineIds }, status: 'CONECTADA' }
-    })
-    if (lineasSeleccionadas.length === 0) {
-      return res.status(400).json({
-        error: 'Las líneas seleccionadas no están conectadas. Conectalas antes de enviar.'
-      })
+    let lineasSeleccionadas = []
+for (const lid of lineIds) {
+    const line = await prisma.lineas_whatsapp.findUnique({ where: { id: lid } })
+    const client = line ? waService.clients.get(line.id) : null
+    const isReallyConnected = client && client.user && client.ws?.readyState === 1
+    
+    if (isReallyConnected) {
+        lineasSeleccionadas.push(line)
+        console.log(`      ✅ Línea ${line.phone} REALMENTE conectada (user: ${!!client.user})`)
+    } else if (line) {
+        console.log(`      ⚠️ Línea ${line.phone} status=${line.status} pero socket NO listo (user: ${!!client?.user}, readyState: ${client?.ws?.readyState})`)
     }
+}
+
+if (lineasSeleccionadas.length === 0) {
+    console.log(`   ⏳ Líneas no listas. Reprogramando campaña para próximo ciclo.`)
+    // NO marcar failed. Dejar pending para que el cron la reintente en 5 min.
+    await prisma.scheduled_campaigns.update({
+        where: { id: sched.id },
+        data: { 
+            status: 'pending',
+            error: `Líneas no conectadas. Reintento ${(sched.attempts || 0) + 1}/3`
+        }
+    })
+    continue
+}
 
     const isPending = body.schedule === 'pending'
     const isScheduled = body.schedule === 'scheduled' && body.execute_at
@@ -1390,8 +1408,8 @@ const executeAt = DateTime.fromISO(body.execute_at, { zone: 'America/Argentina/B
 
     // ─── ENVIAR AHORA (now) ───
     const sendOptions = {
-      delayMin: body.delay_min || 8000,
-      delayMax: body.delay_max || 15000,
+      delayMin: body.delay_min || 15000,
+      delayMax: body.delay_max || 25000,
       imageUrl: body.image_url || null,
       humanMode: body.human_mode === true,
       skipBlacklist: body.skipBlacklist === true,
@@ -2926,12 +2944,6 @@ cron.schedule('*/5 * * * *', async () => {
 
   try {
     // 1. Reconectar líneas que deberían estar vivas (Railway deploy las mata)
-    try {
-      await waService.init()
-      console.log('🔌 Init ejecutado, líneas reconectadas si era necesario')
-    } catch (initErr) {
-      console.error('⚠️ Init falló (no crítico):', initErr.message)
-    }
 
     // 2. Buscar campañas pendientes + colgadas (processing hace > 20 min)
     const now = new Date()
@@ -3064,8 +3076,8 @@ cron.schedule('*/5 * * * *', async () => {
         })
 
         const sendOptions = {
-          delayMin: 5000,
-          delayMax: 12000,
+          delayMin: 15000,
+          delayMax: 25000,
           imageUrl: campaign.image_url,
           humanMode: campaign.human_mode === true,
           skipBlacklist: true,

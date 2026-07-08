@@ -43,7 +43,9 @@ class WAService {
     this.msgRetryCounterCache = new NodeCache()
     this.lidCache = new Map()
     this.lineOwners = new Map()
+    this.campaignActive = new Map()
     this.sessionHealth = new Map()
+    this.disconnectHistory = {} 
     this.maxLidCacheSize = 5000
     fs.ensureDirSync(this.sessionsDir)
   }
@@ -144,6 +146,32 @@ async connect(phone) {
   // ─── QR ───
   if (qr) {
 
+
+    const wasConnected = this.sessionHealth.get(lineId)?.lastOpen != null
+  if (wasConnected) {
+    console.log(`🚨 QR durante reconexión = sesión invalidada por Meta: ${lineId}`)
+    // NO esperar a que el usuario escanee. Notificar que necesita re-vincular.
+    const ownerId = this.lineOwners.get(lineId)
+    const payload = { 
+      lineId, 
+      status: 'DESCONECTADA', 
+      reason: 'SESSION_REVOKED_BY_META', 
+      phone: maskPhone(phone),
+      message: 'WhatsApp invalidó la sesión por comportamiento automatizado. Reconectá desde el panel.'
+    }
+    if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
+    else this.io.emit('status', payload)
+    
+    // Limpiar todo para que no quede en loop
+    await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
+    this.clients.delete(lineId)
+    await this.prisma.lineas_whatsapp.update({
+      where: { id: lineId },
+      data: { status: 'DESCONECTADA' }
+    }).catch(() => {})
+    return
+  }
+
      const health = this.sessionHealth.get(lineId)
     if (health?.lastOpen && (Date.now() - health.lastOpen.getTime() < 60000)) {
         console.log(`🧹 Sesión corrupta detectada (QR < 60s después de open). Limpiando ${lineId}`)
@@ -186,14 +214,14 @@ async connect(phone) {
       delete this.presenceIntervals[lineId]
     }
 
-    // Keep-alive cada 3 minutos (antídoto al 408)
     this.presenceIntervals[lineId] = setInterval(async () => {
-      try {
-        if (waClient?.ws?.readyState === 1) {
-          await waClient.sendPresenceUpdate('available')
-        }
-      } catch (e) {}
-    }, 180000)
+  try {
+    if (this.campaignActive.get(lineId)) return // NO enviar presence durante campaña
+    if (waClient?.ws?.readyState === 1) {
+      await waClient.sendPresenceUpdate('available')
+    }
+  } catch (e) {}
+}, 180000)
 
     const ownerId = this.lineOwners.get(lineId)
     const payload = { lineId, status: 'CONECTADA', phone: maskPhone(phone) }
@@ -212,6 +240,26 @@ async connect(phone) {
 
   // ─── CERRADO ───
   if (connection === 'close') {
+
+
+    const now = Date.now()
+if (!this.disconnectHistory[lineId]) this.disconnectHistory[lineId] = []
+this.disconnectHistory[lineId].push(now)
+// Limpiar historial > 10 min
+this.disconnectHistory[lineId] = this.disconnectHistory[lineId].filter(t => now - t < 600000)
+
+if (this.disconnectHistory[lineId].length >= 3) {
+  console.log(`🚫 Circuit breaker: ${lineId} se desconectó 3 veces en 10 min. Deteniendo reconexiones.`)
+  await this.prisma.lineas_whatsapp.update({
+    where: { id: lineId },
+    data: { status: 'DESCONECTADA' }
+  }).catch(() => {})
+  const ownerId = this.lineOwners.get(lineId)
+  const payload = { lineId, status: 'DESCONECTADA', reason: 'CIRCUIT_BREAKER', phone: maskPhone(phone) }
+  if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
+  else this.io.emit('status', payload)
+  return
+}
     
      const currentClient = this.clients.get(lineId)
   if (currentClient && currentClient !== waClient) {
@@ -661,6 +709,9 @@ if (existingBl) {
 
   async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
   // 🔐 INLINE LICENSE CHECK
+  for (const line of lineasSeleccionadas) {
+  this.campaignActive.set(line.id, true)
+}
   const licenseConfig = await this.prisma.app_config.findUnique({ where: { key: 'license' } })
   if (!licenseConfig?.value) throw new Error('LICENSE_REQUIRED')
   const license = this.validateLicense(licenseConfig.value)
