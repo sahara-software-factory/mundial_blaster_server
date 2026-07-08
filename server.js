@@ -1256,35 +1256,47 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       return res.status(400).json({ error: 'Debes seleccionar al menos una línea' })
     }
 
-    let lineasSeleccionadas = []
-for (const lid of lineIds) {
-    const line = await prisma.lineas_whatsapp.findUnique({ where: { id: lid } })
-    const client = line ? waService.clients.get(line.id) : null
-    const isReallyConnected = client && client.user && client.ws?.readyState === 1
-    
-    if (isReallyConnected) {
-        lineasSeleccionadas.push(line)
-        console.log(`      ✅ Línea ${line.phone} REALMENTE conectada (user: ${!!client.user})`)
-    } else if (line) {
-        console.log(`      ⚠️ Línea ${line.phone} status=${line.status} pero socket NO listo (user: ${!!client?.user}, readyState: ${client?.ws?.readyState})`)
-    }
-}
-
-if (lineasSeleccionadas.length === 0) {
-    console.log(`   ⏳ Líneas no listas. Reprogramando campaña para próximo ciclo.`)
-    // NO marcar failed. Dejar pending para que el cron la reintente en 5 min.
-    await prisma.scheduled_campaigns.update({
-        where: { id: sched.id },
-        data: { 
-            status: 'pending',
-            error: `Líneas no conectadas. Reintento ${(sched.attempts || 0) + 1}/3`
-        }
+    // ─── VERIFICAR QUE LAS LÍNEAS EXISTAN (siempre) ───
+    const lineRecords = await prisma.lineas_whatsapp.findMany({
+      where: { id: { in: lineIds } }
     })
-    continue
-}
+    if (lineRecords.length === 0) {
+      return res.status(400).json({ error: 'Las líneas seleccionadas no existen' })
+    }
+    if (lineRecords.length !== lineIds.length) {
+      const foundIds = new Set(lineRecords.map(l => l.id))
+      const missing = lineIds.filter(id => !foundIds.has(id))
+      console.warn('⚠️ Líneas no encontradas:', missing)
+    }
 
     const isPending = body.schedule === 'pending'
     const isScheduled = body.schedule === 'scheduled' && body.execute_at
+    const isNow = !isPending && !isScheduled
+
+    // ─── SI ES ENVÍO INMEDIATO: verificar que estén conectadas AHORA ───
+    let lineasActivas = []
+    if (isNow) {
+      for (const line of lineRecords) {
+        const client = waService.clients.get(line.id)
+        const isReallyConnected = client && client.user && client.ws?.readyState === 1
+        if (isReallyConnected) {
+          lineasActivas.push(line)
+          console.log(`      ✅ Línea ${line.phone} REALMENTE conectada`)
+        } else {
+          console.log(`      ⚠️ Línea ${line.phone} no está conectada ahora (user:${!!client?.user}, readyState:${client?.ws?.readyState})`)
+        }
+      }
+      if (lineasActivas.length === 0) {
+        return res.status(400).json({
+          error: 'Las líneas seleccionadas no están conectadas. Conectalas antes de enviar.',
+          lines: lineRecords.map(l => ({ id: l.id, phone: l.phone, status: l.status }))
+        })
+      }
+    }
+
+    // ─── PARA PENDING/SCHEDULED: usamos las líneas existentes (no importa si están off ahora) ───
+    const linesToSave = isNow ? lineasActivas : lineRecords
+
     const isRoundRobin = body.distribution_mode === 'round_robin'
 
     // Validaciones de tier
@@ -1339,8 +1351,8 @@ if (lineasSeleccionadas.length === 0) {
         status: 'pending', // ← siempre pending al crear, el cron o el start la cambian
         targets: body.targets,
         distribution_mode: isRoundRobin ? 'round_robin' : 'single',
-        line_id: lineasSeleccionadas[0]?.id || '',
-        selected_lines: JSON.stringify(lineasSeleccionadas.map(l => l.id)),
+        line_id: linesToSave[0]?.id || lineRecords[0]?.id || '',
+        selected_lines: JSON.stringify(lineRecords.map(l => l.id)),
         human_mode: body.human_mode === true,
         proxy_node: body.proxy_node || null,
         proxy_ip: body.proxy_ip || null,
@@ -1360,7 +1372,7 @@ if (lineasSeleccionadas.length === 0) {
           status: 'pending',
           total: body.targets.length,
           distribution_mode: isRoundRobin ? 'round_robin' : 'single',
-          lines: lineasSeleccionadas.map(l => ({ id: l.id, phone: l.phone, nombre: l.nombre }))
+          lines: lineRecords.map(l => ({ id: l.id, phone: l.phone, nombre: l.nombre }))
         }
       })
     }
@@ -1368,9 +1380,9 @@ if (lineasSeleccionadas.length === 0) {
     // ─── PROGRAMAR (scheduled) ───
     if (isScheduled) {
       const { DateTime } = require('luxon')
-const executeAt = DateTime.fromISO(body.execute_at, { zone: 'America/Argentina/Buenos_Aires' }).toUTC().toJSDate()
+      const executeAt = DateTime.fromISO(body.execute_at, { zone: 'America/Argentina/Buenos_Aires' }).toUTC().toJSDate()
       const now = new Date()
-      
+
       if (isNaN(executeAt.getTime())) {
         return res.status(400).json({ error: 'Fecha de programación inválida' })
       }
@@ -1400,7 +1412,7 @@ const executeAt = DateTime.fromISO(body.execute_at, { zone: 'America/Argentina/B
           status: 'pending',
           total: body.targets.length,
           distribution_mode: isRoundRobin ? 'round_robin' : 'single',
-          lines: lineasSeleccionadas.map(l => ({ id: l.id, phone: l.phone, nombre: l.nombre }))
+          lines: lineRecords.map(l => ({ id: l.id, phone: l.phone, nombre: l.nombre }))
         },
         scheduledFor: body.execute_at
       })
@@ -1422,7 +1434,7 @@ const executeAt = DateTime.fromISO(body.execute_at, { zone: 'America/Argentina/B
       data: { status: 'running' }
     }).catch(() => {})
 
-    waService.sendCampaign(newCampaign.id, lineasSeleccionadas, body.targets, body.message.trim(), sendOptions)
+    waService.sendCampaign(newCampaign.id, lineasActivas, body.targets, body.message.trim(), sendOptions)
       .then(() => console.log(`✅ Campaña ${newCampaign.id} finalizada`))
       .catch(err => console.error(`❌ Campaña ${newCampaign.id} falló:`, err))
 
@@ -1434,7 +1446,7 @@ const executeAt = DateTime.fromISO(body.execute_at, { zone: 'America/Argentina/B
         status: 'running',
         total: body.targets.length,
         distribution_mode: isRoundRobin ? 'round_robin' : 'single',
-        lines: lineasSeleccionadas.map(l => ({ id: l.id, phone: l.phone, nombre: l.nombre }))
+        lines: lineasActivas.map(l => ({ id: l.id, phone: l.phone, nombre: l.nombre }))
       }
     })
 
@@ -2943,8 +2955,6 @@ cron.schedule('*/5 * * * *', async () => {
   console.log(`\n⏰ CRON START | Server: ${localShort} | UTC: ${utc}`)
 
   try {
-    // 1. Reconectar líneas que deberían estar vivas (Railway deploy las mata)
-
     // 2. Buscar campañas pendientes + colgadas (processing hace > 20 min)
     const now = new Date()
     const twentyMinAgo = new Date(now.getTime() - 20 * 60 * 1000)
@@ -2985,7 +2995,7 @@ cron.schedule('*/5 * * * *', async () => {
 
         if (!campaign) {
           console.error(`❌ Campaña ${sched.campaign_id} no existe en DB`)
-          await prisma.scheduled_campaigns.update({ where: { id: sched.id }, data: { status: 'failed' } })
+          await prisma.scheduled_campaigns.update({ where: { id: sched.id }, data: { status: 'failed', error: 'Campaña no existe' } })
           continue
         }
 
@@ -3015,7 +3025,7 @@ cron.schedule('*/5 * * * *', async () => {
           continue
         }
 
-        // ─── LÍNEAS (reconectar si es necesario) ───
+        // ─── LÍNEAS (verificar sockets REALMENTE activos) ───
         let lineIds = []
         try {
           if (campaign.selected_lines) lineIds = JSON.parse(campaign.selected_lines)
@@ -3024,23 +3034,23 @@ cron.schedule('*/5 * * * *', async () => {
 
         console.log(`   🔌 Buscando líneas: ${lineIds.join(', ') || 'NINGUNA'}`)
 
-        // Verificar sockets activos, no solo DB status
         let lineasSeleccionadas = []
         for (const lid of lineIds) {
           const line = await prisma.lineas_whatsapp.findUnique({ where: { id: lid } })
-          const socketAlive = line ? waService.clients.get(line.id)?.user : null
-          if (line && socketAlive) {
+          const client = line ? waService.clients.get(line.id) : null
+          const isReallyConnected = client && client.user && client.ws?.readyState === 1
+
+          if (isReallyConnected) {
             lineasSeleccionadas.push(line)
-            console.log(`      ✅ Línea ${line.phone} CONECTADA (socket vivo)`)
+            console.log(`      ✅ Línea ${line.phone} REALMENTE conectada (user: ${!!client.user})`)
           } else if (line) {
-            console.log(`      ⚠️ Línea ${line.phone} status=${line.status} pero socket MUERTO`)
+            console.log(`      ⚠️ Línea ${line.phone} status=${line.status} pero socket NO listo (user: ${!!client?.user}, readyState: ${client?.ws?.readyState})`)
           }
         }
 
-        // Si no hay líneas vivas, NO fallar. Reintentar en próximo ciclo (5 min).
+        // Si no hay líneas vivas, reintentar en próximo ciclo (5 min)
         if (lineasSeleccionadas.length === 0) {
           console.log(`   ⏳ SIN LÍNEAS VIVAS. Reintentando en próximo ciclo (5 min).`)
-          // Volver a pending para reintentar (máximo 3 intentos)
           const attempts = (sched.attempts || 0) + 1
           if (attempts >= 3) {
             console.log(`   ❌ Máximo reintentos alcanzado (3). Marcando failed.`)
@@ -3059,17 +3069,17 @@ cron.schedule('*/5 * * * *', async () => {
           continue
         }
 
-        // ─── EJECUTAR ───
-
+        // ─── ANTI-DUPLICADO: si ya está running, no ejecutar de nuevo ───
         if (campaign.status === 'running') {
-            console.log(`⚠️ La campaña ${campaign.id} ya está corriendo. Evitando duplicado.`);
-            await prisma.scheduled_campaigns.update({
-                where: { id: sched.id },
-                data: { status: 'completed' } // Ya está corriendo, este schedule ya no sirve
-            });
-            continue;
+          console.log(`⚠️ La campaña ${campaign.id} ya está corriendo. Evitando duplicado.`)
+          await prisma.scheduled_campaigns.update({
+            where: { id: sched.id },
+            data: { status: 'completed' }
+          })
+          continue
         }
 
+        // ─── MARCAR CAMPAÑA COMO RUNNING ───
         await prisma.campaigns.update({
           where: { id: campaign.id },
           data: { status: 'running' }
@@ -3085,19 +3095,39 @@ cron.schedule('*/5 * * * *', async () => {
         }
 
         console.log(`   📤 Enviando campaña...`)
-         waService.sendCampaign(
-          campaign.id,
-          lineasSeleccionadas,
-          parsedTargets,
-          campaign.message,
-          sendOptions
-        )
 
-        console.log(`   ✅ Campaña ${campaign.id} completada`)
-        await prisma.scheduled_campaigns.update({
-          where: { id: sched.id },
-          data: { status: 'completed', error: null }
-        })
+        // ─── EJECUTAR CON AWAIT Y TRY/CATCH ───
+        try {
+          await waService.sendCampaign(
+            campaign.id,
+            lineasSeleccionadas,
+            parsedTargets,
+            campaign.message,
+            sendOptions
+          )
+          console.log(`   ✅ Campaña ${campaign.id} completada`)
+
+          await prisma.scheduled_campaigns.update({
+            where: { id: sched.id },
+            data: { status: 'completed', error: null }
+          })
+          await prisma.campaigns.update({
+            where: { id: campaign.id },
+            data: { status: 'completed' }
+          }).catch(e => console.error(`   ⚠️ Error actualizando campaigns:`, e.message))
+
+        } catch (sendErr) {
+          console.error(`   ❌ Error en sendCampaign:`, sendErr.message)
+          await prisma.scheduled_campaigns.update({
+            where: { id: sched.id },
+            data: { status: 'failed', error: sendErr.message?.slice(0, 500) }
+          })
+          await prisma.campaigns.update({
+            where: { id: campaign.id },
+            data: { status: 'failed' }
+          }).catch(() => {})
+          continue
+        }
 
       } catch (err) {
         console.error(`   ❌ Error ejecutando scheduled ${sched.id}:`, err.message)
