@@ -2866,16 +2866,21 @@ cron.schedule('*/5 * * * *', async () => {
     }
 
     const now = new Date()
-    const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000)
-
-    // Buscar scheduled pendientes que ya deberían ejecutarse
+    
+    // Buscar TODAS las scheduled pendientes que ya deberían ejecutarse
+    // (sin límite de oneHourAgo, que puede causar desfases)
     const pending = await prisma.scheduled_campaigns.findMany({
       where: {
         status: 'pending',
-        execute_at: { lte: now, gte: oneHourAgo }
+        execute_at: { lte: now }
       },
       orderBy: { execute_at: 'asc' }
     })
+
+    console.log(`⏰ Cron check: now=${now.toISOString()}, encontradas=${pending.length} campañas`)
+    for (const p of pending) {
+      console.log(`  📋 scheduled ${p.id}: execute_at=${p.execute_at.toISOString()}, status=${p.status}`)
+    }
 
     if (pending.length === 0) {
       console.log('⏰ Cron: No hay campañas programadas pendientes')
