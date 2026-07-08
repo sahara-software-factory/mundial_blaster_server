@@ -3048,6 +3048,16 @@ cron.schedule('*/5 * * * *', async () => {
         }
 
         // ─── EJECUTAR ───
+
+        if (campaign.status === 'running') {
+            console.log(`⚠️ La campaña ${campaign.id} ya está corriendo. Evitando duplicado.`);
+            await prisma.scheduled_campaigns.update({
+                where: { id: sched.id },
+                data: { status: 'completed' } // Ya está corriendo, este schedule ya no sirve
+            });
+            continue;
+        }
+
         await prisma.campaigns.update({
           where: { id: campaign.id },
           data: { status: 'running' }
@@ -3063,7 +3073,7 @@ cron.schedule('*/5 * * * *', async () => {
         }
 
         console.log(`   📤 Enviando campaña...`)
-        await waService.sendCampaign(
+         waService.sendCampaign(
           campaign.id,
           lineasSeleccionadas,
           parsedTargets,
@@ -3113,14 +3123,20 @@ async function alertOwner(type, data) {
 async function gracefulShutdown(signal) {
   console.log(`\n🛑 ${signal} recibido. Cerrando ${waService.clients.size} sockets...`)
   
+  // 1. MATAR SOCKET.IO PRIMERO (Vital para que el server no se cuelgue)
+  if (io) {
+    io.close() 
+  }
+
   const closePromises = []
   for (const [lineId, client] of waService.clients.entries()) {
     closePromises.push(
       new Promise((resolve) => {
         try {
-          client.ws?.close()
-          // Darle 2 segundos a Baileys para guardar credenciales
-          setTimeout(resolve, 2000)
+          // 2. USAR client.end() NO client.ws.close()
+          client.end(undefined) 
+          // Darle 3 segundos a Baileys para escribir el último creds.json
+          setTimeout(resolve, 3000)
         } catch (e) {
           resolve()
         }
@@ -3139,16 +3155,17 @@ async function gracefulShutdown(signal) {
   }
   
   await prisma.$disconnect()
+  
   server.close(() => {
     console.log('✅ Servidor cerrado gracefulmente')
     process.exit(0)
   })
   
-  // Fallback si algo se cuelga
+  // Reducimos el fallback a 5s, no 10s.
   setTimeout(() => {
-    console.log('⚠️ Forzando salida después de 10s')
+    console.log('⚠️ Forzando salida después de 5s')
     process.exit(0)
-  }, 10000)
+  }, 5000)
 }
 
  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
