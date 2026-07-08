@@ -192,11 +192,11 @@ async connect(phone) {
     }
     
     await this.prisma.lineas_whatsapp.update({
-      where: { id: lineId },
-      data: { status: 'CONECTADA' }
-    }).catch(() => {})
-    return
-  }
+            where: { id: lineId },
+            data: { status: 'CONECTADA' }
+        }).catch(e => console.error(`❌ DB update CONECTADA falló:`, e.message))
+        return
+    }
 
   // ─── CERRADO ───
   if (connection === 'close') {

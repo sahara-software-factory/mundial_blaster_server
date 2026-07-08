@@ -1087,6 +1087,7 @@ app.post('/api/lineas/connect', authOrSecret, requireLicense, async (req, res) =
   }
 })
 
+
 app.get('/api/lineas', authOrSecret, requireLicense, async (req, res) => {
   try {
     const userId = req.user?.sub || req.user?.id || req.userId
@@ -1141,6 +1142,23 @@ app.post('/api/lineas/logout', authOrSecret, requireLicense, async (req, res) =>
     res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: err.message })
+  }
+})
+
+app.get('/api/lineas/:id', authOrSecret, requireLicense, async (req, res) => {
+  try {
+    const { id } = req.params
+    const userId = req.user?.sub || req.user?.id || req.userId
+    const line = await prisma.lineas_whatsapp.findFirst({
+      where: {
+        id,
+        ...(userId ? { owner_id: userId } : {})
+      }
+    })
+    if (!line) return res.status(404).json({ error: 'Línea no encontrada' })
+    res.json(line)
+  } catch (err) {
+    res.status(500).json({ error: 'Error obteniendo línea' })
   }
 })
 
