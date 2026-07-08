@@ -2998,6 +2998,18 @@ async function alertOwner(type, data) {
   } catch (e) { /* Silencioso. Nunca falla. */ }
 }
 
+// Agregar cerca del final de server.js, antes del server.listen:
+process.on('SIGTERM', async () => {
+  console.log('🔴 SIGTERM: cerrando sockets Baileys...')
+  for (const [, client] of waService.clients.entries()) {
+    try { client.ws?.close() } catch {}
+  }
+  waService.clients.clear()
+  // 2 segundos para que los archivos de sesión terminen de flushearse al Volume
+  await new Promise(r => setTimeout(r, 2000))
+  await prisma.$disconnect().catch(() => {})
+  process.exit(0)
+})
 // ============================================================
 // SERVER START
 // ============================================================

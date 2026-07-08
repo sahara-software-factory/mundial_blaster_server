@@ -120,8 +120,13 @@ class WAService {
       console.log('⏳ Tier no encontrado, omitiendo connect')
       return null
     }
-    const activeLines = await this.prisma.lineas_whatsapp.count({ where: { status: 'CONECTADA' } }).catch(() => 0)
-    if (activeLines >= tierConfig.maxLines) {
+    const activeLines = await this.prisma.lineas_whatsapp.count({
+  where: {
+    status: 'CONECTADA',
+    id: { not: lineId }   // ← la clave
+  }
+})
+if (activeLines >= tierConfig.maxLines) {
       console.log('⏳ Límite de líneas alcanzado')
       return null
     }
@@ -139,7 +144,24 @@ class WAService {
     }
     
     await fs.ensureDir(sessionPath)
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath)
+    let state, saveCreds
+try {
+  const auth = await useMultiFileAuthState(sessionPath)
+  state = auth.state
+  saveCreds = auth.saveCreds
+} catch (e) {
+  console.warn(`⚠️ Sesión corrupta en ${lineId.slice(0,8)}, limpiando y reiniciando con QR...`)
+  await fs.remove(sessionPath).catch(() => {})
+  await fs.ensureDir(sessionPath)
+  await this.prisma.lineas_whatsapp.update({
+    where: { id: lineId },
+    data: { status: 'DESCONECTADA' }
+  }).catch(() => {})
+  const auth = await useMultiFileAuthState(sessionPath)
+  state = auth.state
+  saveCreds = auth.saveCreds
+  // Va a generar QR porque la sesión es nueva — comportamiento correcto
+}
     const { version } = await fetchLatestBaileysVersion()
     
     // 7. Crear socket Baileys
@@ -257,6 +279,19 @@ class WAService {
             console.log(`⏹️ Reconexión bloqueada para ${lineId} (cancelado por usuario)`)
             return
           }
+
+           await this.prisma.lineas_whatsapp.update({
+    where: { id: lineId },
+    data: { status: 'DESCONECTADA' }
+  }).catch(() => {})
+  
+  const ownerId = this.lineOwners.get(lineId)
+  const payload = { lineId, status: 'DESCONECTADA', reason: 'RECONNECTING' }
+  if (ownerId && this.io.emitToUser) {
+    this.io.emitToUser(ownerId, 'status', payload)
+  } else {
+    this.io.emit('status', payload)
+  }
           
 
           if (this.reconnectTimers[lineId]) clearTimeout(this.reconnectTimers[lineId])
