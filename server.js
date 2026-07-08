@@ -1278,7 +1278,7 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
     if (isNow) {
       for (const line of lineRecords) {
         const client = waService.clients.get(line.id)
-        const isReallyConnected = client && client.user && client.ws?.readyState === 1
+        const isReallyConnected = client && !!client.user
         if (isReallyConnected) {
           lineasActivas.push(line)
           console.log(`      ✅ Línea ${line.phone} REALMENTE conectada`)
@@ -3038,13 +3038,14 @@ cron.schedule('*/5 * * * *', async () => {
         for (const lid of lineIds) {
           const line = await prisma.lineas_whatsapp.findUnique({ where: { id: lid } })
           const client = line ? waService.clients.get(line.id) : null
-          const isReallyConnected = client && client.user && client.ws?.readyState === 1
+          const isReallyConnected = client && !!client.user
+
 
           if (isReallyConnected) {
             lineasSeleccionadas.push(line)
             console.log(`      ✅ Línea ${line.phone} REALMENTE conectada (user: ${!!client.user})`)
           } else if (line) {
-            console.log(`      ⚠️ Línea ${line.phone} status=${line.status} pero socket NO listo (user: ${!!client?.user}, readyState: ${client?.ws?.readyState})`)
+            console.log(`      ⚠️ Línea ${line.phone} status=${line.status} pero socket NO listo (user: ${!!client?.user})`)
           }
         }
 
