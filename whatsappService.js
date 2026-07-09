@@ -141,425 +141,436 @@ async connect(phone) {
     waClient.ev.on('creds.update', saveCreds)
 
     waClient.ev.on('connection.update', async (update) => {
-  const { connection, lastDisconnect, qr } = update
+        const { connection, lastDisconnect, qr } = update
 
-  // ─── QR ───
-  if (qr) {
+        // ─── QR ───
+        if (qr) {
+            const health = this.sessionHealth.get(lineId)
+            const wasRecentlyConnected = health?.lastOpen && (Date.now() - health.lastOpen.getTime() < 120000)
 
+            // 🚨 RECONEXIÓN INVÁLIDA: se conectó hace < 2 min y ahora pide QR = Meta revocó la sesión
+            if (wasRecentlyConnected) {
+                console.log(`🚨 Sesión revocada por Meta (QR < 2min después de open): ${lineId}`)
 
-    const wasConnected = this.sessionHealth.get(lineId)?.lastOpen != null
-  if (wasConnected) {
-    console.log(`🚨 QR durante reconexión = sesión invalidada por Meta: ${lineId}`)
-    // NO esperar a que el usuario escanee. Notificar que necesita re-vincular.
-    const ownerId = this.lineOwners.get(lineId)
-    const payload = { 
-      lineId, 
-      status: 'DESCONECTADA', 
-      reason: 'SESSION_REVOKED_BY_META', 
-      phone: maskPhone(phone),
-      message: 'WhatsApp invalidó la sesión por comportamiento automatizado. Reconectá desde el panel.'
-    }
-    if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
-    else this.io.emit('status', payload)
-    
-    // Limpiar todo para que no quede en loop
-    await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
-    this.clients.delete(lineId)
-    await this.prisma.lineas_whatsapp.update({
-      where: { id: lineId },
-      data: { status: 'DESCONECTADA' }
-    }).catch(() => {})
-    return
-  }
+                // Limpiar todo
+                this.sessionHealth.delete(lineId)
+                await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
+                this.clients.delete(lineId)
 
-     const health = this.sessionHealth.get(lineId)
-    if (health?.lastOpen && (Date.now() - health.lastOpen.getTime() < 60000)) {
-        console.log(`🧹 Sesión corrupta detectada (QR < 60s después de open). Limpiando ${lineId}`)
-        await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
-        this.sessionHealth.delete(lineId)
-        this.clients.delete(lineId)
-        // No emitir QR al frontend, forzar reconexión limpia
-        return
-    }
-    try {
-      const qrDataUrl = await QRCode.toDataURL(qr)
-      const ownerId = this.lineOwners.get(lineId)
-      if (ownerId && this.io.emitToUser) {
-        this.io.emitToUser(ownerId, 'qr', { lineId, qr: qrDataUrl })
-      } else {
-        this.io.emit('qr', { lineId, qr: qrDataUrl })
-      }
-      await this.prisma.lineas_whatsapp.update({
-        where: { id: lineId },
-        data: { status: 'PENDING' }
-      }).catch(() => {})
-      console.log(`📱 QR emitido: ${lineId}`)
-    } catch (e) {
-      console.error('Error QR:', e)
-    }
-    return
-  }
+                // Bloquear reconexión automática para evitar loop
+                if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] === 'number') {
+                    clearTimeout(this.reconnectTimers[lineId])
+                }
+                this.reconnectTimers[lineId] = 'REVOKED'
 
-  // ─── CONECTADO ───
-  if (connection === 'open') {
-    console.log(`✅ Conectado: ${lineId}`)
-    this.sessionHealth.set(lineId, { lastOpen: new Date(), qrAfterOpen: false })
-    
-    if (this.reconnectTimers[lineId]) {
-      clearTimeout(this.reconnectTimers[lineId])
-      delete this.reconnectTimers[lineId]
-    }
-    if (this.presenceIntervals[lineId]) {
-      clearInterval(this.presenceIntervals[lineId])
-      delete this.presenceIntervals[lineId]
-    }
-
-    this.presenceIntervals[lineId] = setInterval(async () => {
-  try {
-    if (this.campaignActive.get(lineId)) return // NO enviar presence durante campaña
-    if (waClient?.ws?.readyState === 1) {
-      await waClient.sendPresenceUpdate('available')
-    }
-  } catch (e) {}
-}, 180000)
-
-    const ownerId = this.lineOwners.get(lineId)
-    const payload = { lineId, status: 'CONECTADA', phone: maskPhone(phone) }
-    if (ownerId && this.io.emitToUser) {
-      this.io.emitToUser(ownerId, 'status', payload)
-    } else {
-      this.io.emit('status', payload)
-    }
-    
-    await this.prisma.lineas_whatsapp.update({
-            where: { id: lineId },
-            data: { status: 'CONECTADA' }
-        }).catch(e => console.error(`❌ DB update CONECTADA falló:`, e.message))
-        return
-    }
-
-  // ─── CERRADO ───
-  if (connection === 'close') {
-
-
-    const now = Date.now()
-if (!this.disconnectHistory[lineId]) this.disconnectHistory[lineId] = []
-this.disconnectHistory[lineId].push(now)
-// Limpiar historial > 10 min
-this.disconnectHistory[lineId] = this.disconnectHistory[lineId].filter(t => now - t < 600000)
-
-if (this.disconnectHistory[lineId].length >= 3) {
-  console.log(`🚫 Circuit breaker: ${lineId} se desconectó 3 veces en 10 min. Deteniendo reconexiones.`)
-  await this.prisma.lineas_whatsapp.update({
-    where: { id: lineId },
-    data: { status: 'DESCONECTADA' }
-  }).catch(() => {})
-  const ownerId = this.lineOwners.get(lineId)
-  const payload = { lineId, status: 'DESCONECTADA', reason: 'CIRCUIT_BREAKER', phone: maskPhone(phone) }
-  if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
-  else this.io.emit('status', payload)
-  return
-}
-    
-     const currentClient = this.clients.get(lineId)
-  if (currentClient && currentClient !== waClient) {
-    console.log(`🔄 Socket reemplazado para ${lineId}, ignorando close del socket viejo`)
-    return
-  }
-  
-  if (this.presenceIntervals[lineId]) {
-    clearInterval(this.presenceIntervals[lineId])
-    delete this.presenceIntervals[lineId]
-  }
-
-    const statusCode = lastDisconnect?.error?.output?.statusCode
-    const shouldReconnect = statusCode !== DisconnectReason.loggedOut
-    console.log(`❌ Desconectado ${lineId}. Razón: ${statusCode}`)
-
-    // 401: Sesión invalidada → limpiar auth y pedir QR
-    if (statusCode === 401) {
-      console.log(`🔒 Sesión invalidada (401): ${lineId}`)
-      await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
-      this.clients.delete(lineId)
-      await this.prisma.lineas_whatsapp.update({
-        where: { id: lineId },
-        data: { status: 'DESCONECTADA' }
-      }).catch(() => {})
-      
-      const ownerId = this.lineOwners.get(lineId)
-      const payload = { lineId, status: 'DESCONECTADA', reason: 'SESSION_INVALID', phone: maskPhone(phone) }
-      if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
-      else this.io.emit('status', payload)
-      return
-    }
-
-    // Logout permanente
-    if (!shouldReconnect) {
-      console.log(`⚠️ Logout permanente: ${lineId}`)
-      await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
-      this.clients.delete(lineId)
-      await this.prisma.lineas_whatsapp.update({
-        where: { id: lineId },
-        data: { status: 'DESCONECTADA' }
-      }).catch(() => {})
-      
-      const ownerId = this.lineOwners.get(lineId)
-      const payload = { lineId, status: 'DESCONECTADA', reason: 'LOGOUT', phone: maskPhone(phone) }
-      if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
-      else this.io.emit('status', payload)
-      return
-    }
-    // ─── CANCELLED por stopLine() ───
-    if (this.reconnectTimers[lineId] === 'CANCELLED') {
-      console.log(`⏹️ Reconexión bloqueada por stopLine: ${lineId}`)
-      this.clients.delete(lineId)
-      await this.prisma.lineas_whatsapp.update({
-        where: { id: lineId },
-        data: { status: 'DESCONECTADA' }
-      }).catch(() => {})
-      const ownerId = this.lineOwners.get(lineId)
-      const payload = { lineId, status: 'DESCONECTADA', reason: 'CANCELLED_BY_USER', phone: maskPhone(phone) }
-      if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
-      else this.io.emit('status', payload)
-      return
-    }
-    // ─── Desconexión temporal (428, 503, 440, 515) ───
-    // NO actualizamos la DB. Si hay redeploy, init() la reconectará porque sigue como CONECTADA.
-    console.log(`🔄 Reconexión temporal ${lineId}...`)
-    this.clients.delete(lineId)
-    
-    if (this.reconnectTimers[lineId]) clearTimeout(this.reconnectTimers[lineId])
-    
-    const delay = (statusCode === 503 || statusCode === 428 || statusCode === 515) ? 15000 : 5000
-    
-    this.reconnectTimers[lineId] = setTimeout(() => {
-  if (this.reconnectTimers[lineId] === 'CANCELLED') {
-    console.log(`⏹️ Reconexión abortada por stopLine: ${lineId}`)
-    return
-  }
-  this.connect(phone).catch(e => console.error(`❌ Reconexión fallida ${lineId}:`, e))
-}, delay)
-  }
-})
-
-    waClient.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return
-      for (const msg of messages) {
-        if (!msg.message) continue
-        const messageBody = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
-        const raw = msg.key.remoteJid
-        const alt = msg.key.remoteJidAlt
-        let fromPhone = null
-        let lidDetectado = null
-
-        if (raw?.includes('@s.whatsapp.net')) {
-          fromPhone = raw.split('@')[0].replace(/\D/g, '')
-        } else if (raw?.includes('@lid')) {
-          lidDetectado = raw.split('@')[0]
-        }
-        if (alt?.includes('@s.whatsapp.net')) {
-          fromPhone = alt.split('@')[0].replace(/\D/g, '')
-        } else if (alt?.includes('@lid') && !lidDetectado) {
-          lidDetectado = alt.split('@')[0]
-        }
-
-        if (fromPhone && lidDetectado) {
-          this._setLidCache(`${lineId}:${lidDetectado}`, fromPhone)
-          await this.prisma.lid_mappings.upsert({
-            where: { lineId_lid: { lineId, lid: lidDetectado } },
-            update: { phone: fromPhone, updatedAt: new Date() },
-            create: { lineId, lid: lidDetectado, phone: fromPhone }
-          }).catch(() => {})
-        }
-
-        if (!fromPhone && lidDetectado) {
-          fromPhone = await this.resolvePhoneFromJid(lineId, `${lidDetectado}@lid`)
-        }
-
-        if (!fromPhone) {
-          console.log(`⚠️ JID irresoluble: ${raw}, saltando procesamiento`)
-          continue
-        }
-
-        if (lidDetectado && fromPhone && fromPhone !== lidDetectado) {
-          this._setLidCache(`${lineId}:${lidDetectado}`, fromPhone)
-        }
-
-        if (msg.key.fromMe) {
-          const cmd = messageBody.trim().toLowerCase()
-          let reason = null
-          if (cmd === '!blacklist' || cmd.startsWith('!blacklist ')) {
-            reason = cmd.replace('!blacklist', '').trim() || 'manual desde chat'
-          } else if (cmd === 'comprobante falso' || cmd === 'falso') {
-            reason = 'comprobante falso'
-          } else if (cmd === 'spam') {
-            reason = 'spam'
-          } else if (cmd === 'ban') {
-            reason = 'ban manual'
-          } else if (cmd === 'estafa') {
-            reason = 'estafa'
-          } else if (cmd === 'no') {
-            reason = 'rechazado por operador'
-          }
-
-          if (reason && fromPhone) {
-            try {
-              const cleanPhone = fromPhone.replace(/\D/g, '')
-              const existingBl = await this.prisma.blacklist.findFirst({
-  where: { phone: cleanPhone, owner_id: null }
-})
-let entry
-if (existingBl) {
-  entry = await this.prisma.blacklist.update({
-    where: { id: existingBl.id },
-    data: { reason }
-  })
-} else {
-  entry = await this.prisma.blacklist.create({
-    data: { phone: cleanPhone, reason, owner_id: null }
-  })
-}
-              console.log(`🛡️ Operador marcó blacklist: ${maskPhone(cleanPhone)} → ${reason}`)
-                        // Self-hosted: buscar el único usuario o usar owner del blacklist entry
-          const ownerId = entry?.owner_id || this.lineOwners.get(lineId) || null
-          const payload = { 
-            phone: cleanPhone, 
-            reason, 
-            timestamp: new Date(),
-            entry 
-          }
-          if (ownerId && this.io.emitToUser) {
-            this.io.emitToUser(ownerId, 'operator_blacklist', payload)
-          } else {
-            this.io.emit('operator_blacklist', payload)
-          }
-            } catch (e) {
-              console.error('Operator blacklist error:', e)
-            }
-          }
-          continue
-        }
-
-        try {
-          const config = await this.prisma.app_config.findUnique({ where: { key: 'blacklist_keywords' } })
-          const keywords = config?.value ? JSON.parse(config.value) : ['basta', 'no molesten', 'no me interesa', 'no, gracias', 'eliminar', 'stop', 'darme de baja', 'no quiero que me envien mas mensajes']
-          const lowerBody = messageBody.toLowerCase()
-          const matched = keywords.find(k => lowerBody.includes(k.toLowerCase()))
-          if (matched) {
-            const cleanPhone = fromPhone.replace(/\D/g, '')
-            const existing = await this.prisma.blacklist.findFirst({ where: { phone: cleanPhone } })
-            if (existing) {
-              await this.prisma.blacklist.update({ where: { id: existing.id }, data: { reason: `auto: "${matched}"` } })
-            } else {
-              await this.prisma.blacklist.create({ data: { phone: cleanPhone, reason: `auto: "${matched}"`, owner_id: null } })
-            }
-            console.log(`🚫 Auto-blacklist: ${maskPhone(cleanPhone)} por keyword "${matched}"`)
-                    const ownerId = this.lineOwners.get(lineId) || null
-        const payload = { phone: cleanPhone, keyword: matched, timestamp: new Date() }
-        if (ownerId && this.io.emitToUser) {
-          this.io.emitToUser(ownerId, 'auto_blacklist', payload)
-        } else {
-          this.io.emit('auto_blacklist', payload)
-        }
-          }
-        } catch (e) {
-          console.error('Auto-blacklist error:', e)
-        }
-
-        try {
-          const recentLog = await this.prisma.campaign_logs.findFirst({
-            where: {
-              contact_phone: fromPhone,
-              status: 'sent',
-              created_at: { gte: new Date(Date.now() - 30 * 86400000) }
-            },
-            orderBy: { created_at: 'desc' }
-          })
-          if (recentLog && !recentLog.has_reply) {
-            await this.prisma.campaign_logs.update({
-              where: { id: recentLog.id },
-              data: { has_reply: true, replied_at: new Date() }
-            })
-                        const ownerId = recentLog.owner_id || null
-            const payload = { 
-              campaign_id: recentLog.campaign_id, 
-              phone: fromPhone, 
-              message: messageBody, 
-              timestamp: new Date() 
-            }
-            if (ownerId && this.io.emitToUser) {
-              this.io.emitToUser(ownerId, 'campaign_reply', payload)
-            } else {
-              this.io.emit('campaign_reply', payload)
-            }
-          }
-        } catch (e) {
-          console.error('Reply tracking error:', e)
-        }
-      }
-    })
-
-    waClient.ev.on('messages.update', async (updates) => {
-      for (const update of updates) {
-        const { key, update: statusUpdate } = update
-        if (!key.id || !key.remoteJid) continue
-        if (key.remoteJid.includes('@lid')) {
-          const lidClean = key.remoteJid.split('@')[0]
-          if (!this.lidCache.has(`${lineId}:${lidClean}`)) {
-            try {
-              const logSent = await this.prisma.campaign_logs.findFirst({
-                where: { message_id: key.id }
-              })
-              if (logSent && logSent.contact_phone) {
-                const realPhone = logSent.contact_phone
-                this._setLidCache(`${lineId}:${lidClean}`, realPhone)
-                await this.prisma.lid_mappings.upsert({
-                  where: { lineId_lid: { lineId, lid: lidClean } },
-                  update: { phone: realPhone, updatedAt: new Date() },
-                  create: { lineId, lid: lidClean, phone: realPhone }
+                await this.prisma.lineas_whatsapp.update({
+                    where: { id: lineId },
+                    data: { status: 'DESCONECTADA' }
                 }).catch(() => {})
-                // console.log(`🕵️‍♂️ LID mapeado por Acuse: ${lidClean} -> ${maskPhone(realPhone)}`)
-              }
-            } catch (e) {
-              console.error("Error en Cazador de LIDs:", e)
+
+                const ownerId = this.lineOwners.get(lineId)
+                const payload = { 
+                    lineId, 
+                    status: 'DESCONECTADA', 
+                    reason: 'SESSION_REVOKED', 
+                    phone: maskPhone(phone),
+                    message: 'WhatsApp invalidó la sesión. Reconectá desde el panel.'
+                }
+                if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
+                else this.io.emit('status', payload)
+                return
             }
-          }
+
+            // ─── PRIMERA VEZ / RECONEXIÓN LIMPIA ───
+            try {
+                const qrDataUrl = await QRCode.toDataURL(qr)
+                const ownerId = this.lineOwners.get(lineId)
+                if (ownerId && this.io.emitToUser) {
+                    this.io.emitToUser(ownerId, 'qr', { lineId, qr: qrDataUrl })
+                } else {
+                    this.io.emit('qr', { lineId, qr: qrDataUrl })
+                }
+                await this.prisma.lineas_whatsapp.update({
+                    where: { id: lineId },
+                    data: { status: 'PENDING' }
+                }).catch(() => {})
+                console.log(`📱 QR emitido: ${lineId}`)
+            } catch (e) {
+                console.error('Error QR:', e)
+            }
+            return
         }
-        const phone = await this.resolvePhoneFromJid(lineId, key.remoteJid)
-        if (!phone) continue
-        const log = await this.prisma.campaign_logs.findFirst({
-          where: { contact_phone: phone, message_id: key.id },
-          orderBy: { created_at: 'desc' }
-        })
-        if (!log) continue
-        const ack = statusUpdate?.status || statusUpdate?.ack
-        if (ack === 2 && !log.delivered_at) {
-          await this.prisma.campaign_logs.update({
-            where: { id: log.id },
-            data: { delivered_at: new Date() }
-          })
+
+        // ─── CONECTADO ───
+        if (connection === 'open') {
+            console.log(`✅ Conectado: ${lineId}`)
+            this.sessionHealth.set(lineId, { lastOpen: new Date() })
+
+            if (this.reconnectTimers[lineId]) {
+                clearTimeout(this.reconnectTimers[lineId])
+                delete this.reconnectTimers[lineId]
+            }
+            if (this.presenceIntervals[lineId]) {
+                clearInterval(this.presenceIntervals[lineId])
+                delete this.presenceIntervals[lineId]
+            }
+
+            this.presenceIntervals[lineId] = setInterval(async () => {
+                try {
+                    if (this.campaignActive.get(lineId)) return
+                    if (waClient?.ws?.readyState === 1) {
+                        await waClient.sendPresenceUpdate('available')
+                    }
+                } catch (e) {}
+            }, 180000)
+
+            const ownerId = this.lineOwners.get(lineId)
+            const payload = { lineId, status: 'CONECTADA', phone: maskPhone(phone) }
+            if (ownerId && this.io.emitToUser) {
+                this.io.emitToUser(ownerId, 'status', payload)
+            } else {
+                this.io.emit('status', payload)
+            }
+
+            await this.prisma.lineas_whatsapp.update({
+                where: { id: lineId },
+                data: { status: 'CONECTADA' }
+            }).catch(e => console.error(`❌ DB update CONECTADA falló:`, e.message))
+            return
         }
-        if (ack === 3 && !log.read_at) {
-          await this.prisma.campaign_logs.update({
-            where: { id: log.id },
-            data: { read_at: new Date() }
-          })
+
+        // ─── CERRADO ───
+        if (connection === 'close') {
+            const now = Date.now()
+            if (!this.disconnectHistory[lineId]) this.disconnectHistory[lineId] = []
+            this.disconnectHistory[lineId].push(now)
+            this.disconnectHistory[lineId] = this.disconnectHistory[lineId].filter(t => now - t < 600000)
+
+            if (this.disconnectHistory[lineId].length >= 3) {
+                console.log(`🚫 Circuit breaker: ${lineId} se desconectó 3 veces en 10 min. Deteniendo reconexiones.`)
+                this.sessionHealth.delete(lineId)
+                await this.prisma.lineas_whatsapp.update({
+                    where: { id: lineId },
+                    data: { status: 'DESCONECTADA' }
+                }).catch(() => {})
+                const ownerId = this.lineOwners.get(lineId)
+                const payload = { lineId, status: 'DESCONECTADA', reason: 'CIRCUIT_BREAKER', phone: maskPhone(phone) }
+                if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
+                else this.io.emit('status', payload)
+                return
+            }
+
+            const currentClient = this.clients.get(lineId)
+            if (currentClient && currentClient !== waClient) {
+                console.log(`🔄 Socket reemplazado para ${lineId}, ignorando close del socket viejo`)
+                return
+            }
+
+            if (this.presenceIntervals[lineId]) {
+                clearInterval(this.presenceIntervals[lineId])
+                delete this.presenceIntervals[lineId]
+            }
+
+            const statusCode = lastDisconnect?.error?.output?.statusCode
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+            console.log(`❌ Desconectado ${lineId}. Razón: ${statusCode}`)
+
+            // 401: Sesión invalidada → limpiar auth y pedir QR
+            if (statusCode === 401) {
+                console.log(`🔒 Sesión invalidada (401): ${lineId}`)
+                this.sessionHealth.delete(lineId)
+                await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
+                this.clients.delete(lineId)
+                await this.prisma.lineas_whatsapp.update({
+                    where: { id: lineId },
+                    data: { status: 'DESCONECTADA' }
+                }).catch(() => {})
+
+                const ownerId = this.lineOwners.get(lineId)
+                const payload = { lineId, status: 'DESCONECTADA', reason: 'SESSION_INVALID', phone: maskPhone(phone) }
+                if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
+                else this.io.emit('status', payload)
+                return
+            }
+
+            // Logout permanente
+            if (!shouldReconnect) {
+                console.log(`⚠️ Logout permanente: ${lineId}`)
+                this.sessionHealth.delete(lineId)
+                await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
+                this.clients.delete(lineId)
+                await this.prisma.lineas_whatsapp.update({
+                    where: { id: lineId },
+                    data: { status: 'DESCONECTADA' }
+                }).catch(() => {})
+
+                const ownerId = this.lineOwners.get(lineId)
+                const payload = { lineId, status: 'DESCONECTADA', reason: 'LOGOUT', phone: maskPhone(phone) }
+                if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
+                else this.io.emit('status', payload)
+                return
+            }
+
+            // ─── CANCELLED por stopLine() ───
+            if (this.reconnectTimers[lineId] === 'CANCELLED') {
+                console.log(`⏹️ Reconexión bloqueada por stopLine: ${lineId}`)
+                this.sessionHealth.delete(lineId)
+                this.clients.delete(lineId)
+                await this.prisma.lineas_whatsapp.update({
+                    where: { id: lineId },
+                    data: { status: 'DESCONECTADA' }
+                }).catch(() => {})
+                const ownerId = this.lineOwners.get(lineId)
+                const payload = { lineId, status: 'DESCONECTADA', reason: 'CANCELLED_BY_USER', phone: maskPhone(phone) }
+                if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
+                else this.io.emit('status', payload)
+                return
+            }
+
+            // ─── CANCELLED por REVOKED (Meta) ───
+            if (this.reconnectTimers[lineId] === 'REVOKED') {
+                console.log(`⏹️ Reconexión bloqueada por sesión revocada: ${lineId}`)
+                this.clients.delete(lineId)
+                return
+            }
+
+            // ─── Desconexión temporal (428, 503, 440, 515) ───
+            console.log(`🔄 Reconexión temporal ${lineId}...`)
+            this.clients.delete(lineId)
+
+            if (this.reconnectTimers[lineId]) clearTimeout(this.reconnectTimers[lineId])
+
+            const delay = (statusCode === 503 || statusCode === 428 || statusCode === 515) ? 15000 : 5000
+
+            this.reconnectTimers[lineId] = setTimeout(() => {
+                if (this.reconnectTimers[lineId] === 'CANCELLED' || this.reconnectTimers[lineId] === 'REVOKED') {
+                    console.log(`⏹️ Reconexión abortada (${this.reconnectTimers[lineId]}): ${lineId}`)
+                    return
+                }
+                this.connect(phone).catch(e => console.error(`❌ Reconexión fallida ${lineId}:`, e))
+            }, delay)
         }
-      }
     })
 
+    // ─── MENSAJES (sin cambios) ───
+    waClient.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type !== 'notify') return
+        for (const msg of messages) {
+            if (!msg.message) continue
+            const messageBody = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
+            const raw = msg.key.remoteJid
+            const alt = msg.key.remoteJidAlt
+            let fromPhone = null
+            let lidDetectado = null
+
+            if (raw?.includes('@s.whatsapp.net')) {
+                fromPhone = raw.split('@')[0].replace(/\D/g, '')
+            } else if (raw?.includes('@lid')) {
+                lidDetectado = raw.split('@')[0]
+            }
+            if (alt?.includes('@s.whatsapp.net')) {
+                fromPhone = alt.split('@')[0].replace(/\D/g, '')
+            } else if (alt?.includes('@lid') && !lidDetectado) {
+                lidDetectado = alt.split('@')[0]
+            }
+
+            if (fromPhone && lidDetectado) {
+                this._setLidCache(`${lineId}:${lidDetectado}`, fromPhone)
+                await this.prisma.lid_mappings.upsert({
+                    where: { lineId_lid: { lineId, lid: lidDetectado } },
+                    update: { phone: fromPhone, updatedAt: new Date() },
+                    create: { lineId, lid: lidDetectado, phone: fromPhone }
+                }).catch(() => {})
+            }
+
+            if (!fromPhone && lidDetectado) {
+                fromPhone = await this.resolvePhoneFromJid(lineId, `${lidDetectado}@lid`)
+            }
+
+            if (!fromPhone) {
+                console.log(`⚠️ JID irresoluble: ${raw}, saltando procesamiento`)
+                continue
+            }
+
+            if (lidDetectado && fromPhone && fromPhone !== lidDetectado) {
+                this._setLidCache(`${lineId}:${lidDetectado}`, fromPhone)
+            }
+
+            if (msg.key.fromMe) {
+                const cmd = messageBody.trim().toLowerCase()
+                let reason = null
+                if (cmd === '!blacklist' || cmd.startsWith('!blacklist ')) {
+                    reason = cmd.replace('!blacklist', '').trim() || 'manual desde chat'
+                } else if (cmd === 'comprobante falso' || cmd === 'falso') {
+                    reason = 'comprobante falso'
+                } else if (cmd === 'spam') {
+                    reason = 'spam'
+                } else if (cmd === 'ban') {
+                    reason = 'ban manual'
+                } else if (cmd === 'estafa') {
+                    reason = 'estafa'
+                } else if (cmd === 'no') {
+                    reason = 'rechazado por operador'
+                }
+
+                if (reason && fromPhone) {
+                    try {
+                        const cleanPhone = fromPhone.replace(/\D/g, '')
+                        const existingBl = await this.prisma.blacklist.findFirst({
+                            where: { phone: cleanPhone, owner_id: null }
+                        })
+                        let entry
+                        if (existingBl) {
+                            entry = await this.prisma.blacklist.update({
+                                where: { id: existingBl.id },
+                                data: { reason }
+                            })
+                        } else {
+                            entry = await this.prisma.blacklist.create({
+                                data: { phone: cleanPhone, reason, owner_id: null }
+                            })
+                        }
+                        console.log(`🛡️ Operador marcó blacklist: ${maskPhone(cleanPhone)} → ${reason}`)
+                        const ownerId = entry?.owner_id || this.lineOwners.get(lineId) || null
+                        const payload = { 
+                            phone: cleanPhone, 
+                            reason, 
+                            timestamp: new Date(),
+                            entry 
+                        }
+                        if (ownerId && this.io.emitToUser) {
+                            this.io.emitToUser(ownerId, 'operator_blacklist', payload)
+                        } else {
+                            this.io.emit('operator_blacklist', payload)
+                        }
+                    } catch (e) {
+                        console.error('Operator blacklist error:', e)
+                    }
+                }
+                continue
+            }
+
+            try {
+                const config = await this.prisma.app_config.findUnique({ where: { key: 'blacklist_keywords' } })
+                const keywords = config?.value ? JSON.parse(config.value) : ['basta', 'no molesten', 'no me interesa', 'no, gracias', 'eliminar', 'stop', 'darme de baja', 'no quiero que me envien mas mensajes']
+                const lowerBody = messageBody.toLowerCase()
+                const matched = keywords.find(k => lowerBody.includes(k.toLowerCase()))
+                if (matched) {
+                    const cleanPhone = fromPhone.replace(/\D/g, '')
+                    const existing = await this.prisma.blacklist.findFirst({ where: { phone: cleanPhone } })
+                    if (existing) {
+                        await this.prisma.blacklist.update({ where: { id: existing.id }, data: { reason: `auto: "${matched}"` } })
+                    } else {
+                        await this.prisma.blacklist.create({ data: { phone: cleanPhone, reason: `auto: "${matched}"`, owner_id: null } })
+                    }
+                    console.log(`🚫 Auto-blacklist: ${maskPhone(cleanPhone)} por keyword "${matched}"`)
+                    const ownerId = this.lineOwners.get(lineId) || null
+                    const payload = { phone: cleanPhone, keyword: matched, timestamp: new Date() }
+                    if (ownerId && this.io.emitToUser) {
+                        this.io.emitToUser(ownerId, 'auto_blacklist', payload)
+                    } else {
+                        this.io.emit('auto_blacklist', payload)
+                    }
+                }
+            } catch (e) {
+                console.error('Auto-blacklist error:', e)
+            }
+
+            try {
+                const recentLog = await this.prisma.campaign_logs.findFirst({
+                    where: {
+                        contact_phone: fromPhone,
+                        status: 'sent',
+                        created_at: { gte: new Date(Date.now() - 30 * 86400000) }
+                    },
+                    orderBy: { created_at: 'desc' }
+                })
+                if (recentLog && !recentLog.has_reply) {
+                    await this.prisma.campaign_logs.update({
+                        where: { id: recentLog.id },
+                        data: { has_reply: true, replied_at: new Date() }
+                    })
+                    const ownerId = recentLog.owner_id || null
+                    const payload = { 
+                        campaign_id: recentLog.campaign_id, 
+                        phone: fromPhone, 
+                        message: messageBody, 
+                        timestamp: new Date() 
+                    }
+                    if (ownerId && this.io.emitToUser) {
+                        this.io.emitToUser(ownerId, 'campaign_reply', payload)
+                    } else {
+                        this.io.emit('campaign_reply', payload)
+                    }
+                }
+            } catch (e) {
+                console.error('Reply tracking error:', e)
+            }
+        }
+    })
+
+    // ─── MESSAGES.UPDATE (sin cambios) ───
+    waClient.ev.on('messages.update', async (updates) => {
+        for (const update of updates) {
+            const { key, update: statusUpdate } = update
+            if (!key.id || !key.remoteJid) continue
+            if (key.remoteJid.includes('@lid')) {
+                const lidClean = key.remoteJid.split('@')[0]
+                if (!this.lidCache.has(`${lineId}:${lidClean}`)) {
+                    try {
+                        const logSent = await this.prisma.campaign_logs.findFirst({
+                            where: { message_id: key.id }
+                        })
+                        if (logSent && logSent.contact_phone) {
+                            const realPhone = logSent.contact_phone
+                            this._setLidCache(`${lineId}:${lidClean}`, realPhone)
+                            await this.prisma.lid_mappings.upsert({
+                                where: { lineId_lid: { lineId, lid: lidClean } },
+                                update: { phone: realPhone, updatedAt: new Date() },
+                                create: { lineId, lid: lidClean, phone: realPhone }
+                            }).catch(() => {})
+                        }
+                    } catch (e) {
+                        console.error("Error en Cazador de LIDs:", e)
+                    }
+                }
+            }
+            const phone = await this.resolvePhoneFromJid(lineId, key.remoteJid)
+            if (!phone) continue
+            const log = await this.prisma.campaign_logs.findFirst({
+                where: { contact_phone: phone, message_id: key.id },
+                orderBy: { created_at: 'desc' }
+            })
+            if (!log) continue
+            const ack = statusUpdate?.status || statusUpdate?.ack
+            if (ack === 2 && !log.delivered_at) {
+                await this.prisma.campaign_logs.update({
+                    where: { id: log.id },
+                    data: { delivered_at: new Date() }
+                })
+            }
+            if (ack === 3 && !log.read_at) {
+                await this.prisma.campaign_logs.update({
+                    where: { id: log.id },
+                    data: { read_at: new Date() }
+                })
+            }
+        }
+    })
+
+    // ─── CONTACTS (sin cambios) ───
     waClient.ev.on('contacts.upsert', async (contacts) => {
-      for (const contact of contacts) {
-        await this._storeLidMappingFromContact(lineId, contact).catch(() => {})
-      }
+        for (const contact of contacts) {
+            await this._storeLidMappingFromContact(lineId, contact).catch(() => {})
+        }
     })
 
     waClient.ev.on('contacts.update', async (updates) => {
-      for (const update of updates) {
-        await this._storeLidMappingFromContact(lineId, update).catch(() => {})
-      }
+        for (const update of updates) {
+            await this._storeLidMappingFromContact(lineId, update).catch(() => {})
+        }
     })
-  }
+}
 
   cleanJid(jid) {
     if (!jid) return ''
