@@ -1018,7 +1018,7 @@ setupEvents(waClient, lineId, phone, saveCreds) {
       console.log(`⚠️ No se pudo eliminar la sesión de la DB: ${e.message}`)
     }
     try {
-      const exists = await this.prisma.lineas_whatsapp.findUnique({ where: { id: lineId } })
+       const exists = await this.prisma.lineas_whatsapp.findUnique({ where: { id: lineId } })
       if (exists) {
         this.lineOwners.delete(lineId)
         await this.prisma.lineas_whatsapp.update({
