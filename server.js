@@ -3132,7 +3132,7 @@ const pending = await prisma.scheduled_campaigns.findMany({
           data: { status: 'running' }
         })
 
-        const sendOptions = {
+         const sendOptions = {
           delayMin: 15000,
           delayMax: 25000,
           imageUrl: campaign.image_url,
