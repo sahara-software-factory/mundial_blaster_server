@@ -3137,7 +3137,7 @@ const pending = await prisma.scheduled_campaigns.findMany({
           delayMax: 25000,
           imageUrl: campaign.image_url,
           humanMode: campaign.human_mode === true,
-          sskipBlacklist: body.skipBlacklist !== false,
+          skipBlacklist: true,
           ownerId: campaign.owner_id || null
         }
 

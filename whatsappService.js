@@ -37,6 +37,7 @@ class WAService {
     this.validateLicense = validateLicenseFn
     this.tierLimits = tierLimits || {}
     this.clients = new Map()
+    this.connectingLocks = new Set()
     this.reconnectTimers = {}
     this.presenceIntervals = {}
     this.sessionsDir = '/app/sessions'
@@ -88,28 +89,35 @@ async connect(phone) {
     }
 
     const lineId = line.id
+
+    // 🔥 EL CANDADO ANTI-CLONES: Evita que el frontend dispare esto 2 veces seguidas
+    if (this.connectingLocks.has(lineId)) {
+      console.log(`⏳ Conexión ya en progreso para ${lineId}, ignorando petición duplicada.`)
+      return line
+    }
+    this.connectingLocks.add(lineId) // Ponemos el candado
+
     const ownerId = line.owner_id || null
     this.lineOwners.set(lineId, ownerId)
     
-    // Limpiar flag CANCELLED si existe (permite reconexión manual tras stopLine)
+    // Limpiar flag CANCELLED si existe
     if (this.reconnectTimers[lineId] === 'CANCELLED') {
       delete this.reconnectTimers[lineId]
     }
-   
     
     // Cerrar socket previo si quedó colgado (zombie)
     const existing = this.clients.get(lineId)
     if (existing) {
-      try { existing.ws?.close() } catch {}
+      try { existing.end(undefined) } catch {} // Usamos end() en lugar de close()
       this.clients.delete(lineId)
       await new Promise(r => setTimeout(r, 500))
     }
 
-  
+    // Usar la Base de Datos Neon (PostgreSQL)
     const { state, saveCreds } = await usePrismaAuthState(this.prisma, lineId);
     const { version } = await fetchLatestBaileysVersion()
 
-    const waClient = makeWASocket ({
+    const waClient = makeWASocket({
       version,
       logger,
       printQRInTerminal: false,
@@ -130,9 +138,14 @@ async connect(phone) {
 
     this.clients.set(lineId, waClient)
     this.setupEvents(waClient, lineId, phone, saveCreds)
+    
+    this.connectingLocks.delete(lineId) // Quitamos el candado al terminar
     return line
+
   } catch (err) {
     console.error('❌ Error connect:', err)
+    // Importante: Si hay error, quitamos el candado para que no quede bloqueado
+    if (line) this.connectingLocks.delete(line.id)
     return null
   }
 }
