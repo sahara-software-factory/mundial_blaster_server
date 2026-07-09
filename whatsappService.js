@@ -143,69 +143,35 @@ async connect(phone) {
     waClient.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update
 
-        // ─── QR ───
+        // ─── 1. EVENTO QR (LIMPIO: Sin autodestrucción) ───
         if (qr) {
-            const health = this.sessionHealth.get(lineId)
-            const wasRecentlyConnected = health?.lastOpen && (Date.now() - health.lastOpen.getTime() < 120000)
-
-            // 🚨 RECONEXIÓN INVÁLIDA: se conectó hace < 2 min y ahora pide QR = Meta revocó la sesión
-            if (wasRecentlyConnected) {
-                console.log(`🚨 Sesión revocada por Meta (QR < 2min después de open): ${lineId}`)
-
-                // Limpiar todo
-                this.sessionHealth.delete(lineId)
-                await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
-                this.clients.delete(lineId)
-
-                // Bloquear reconexión automática para evitar loop
-                if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] === 'number') {
-                    clearTimeout(this.reconnectTimers[lineId])
-                }
-                this.reconnectTimers[lineId] = 'REVOKED'
-
-                await this.prisma.lineas_whatsapp.update({
-                    where: { id: lineId },
-                    data: { status: 'DESCONECTADA' }
-                }).catch(() => {})
-
-                const ownerId = this.lineOwners.get(lineId)
-                const payload = { 
-                    lineId, 
-                    status: 'DESCONECTADA', 
-                    reason: 'SESSION_REVOKED', 
-                    phone: maskPhone(phone),
-                    message: 'WhatsApp invalidó la sesión. Reconectá desde el panel.'
-                }
-                if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
-                else this.io.emit('status', payload)
-                return
-            }
-
-            // ─── PRIMERA VEZ / RECONEXIÓN LIMPIA ───
             try {
                 const qrDataUrl = await QRCode.toDataURL(qr)
-                const ownerId = this.lineOwners.get(lineId)
+                const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
+                
                 if (ownerId && this.io.emitToUser) {
                     this.io.emitToUser(ownerId, 'qr', { lineId, qr: qrDataUrl })
                 } else {
                     this.io.emit('qr', { lineId, qr: qrDataUrl })
                 }
+                
                 await this.prisma.lineas_whatsapp.update({
                     where: { id: lineId },
                     data: { status: 'PENDING' }
                 }).catch(() => {})
-                console.log(`📱 QR emitido: ${lineId}`)
+                
+                console.log(`📱 QR emitido al frontend: ${lineId}`)
             } catch (e) {
-                console.error('Error QR:', e)
+                console.error('Error generando QR:', e)
             }
             return
         }
 
-        // ─── CONECTADO ───
+        // ─── 2. EVENTO CONECTADO ───
         if (connection === 'open') {
             console.log(`✅ Conectado: ${lineId}`)
-            this.sessionHealth.set(lineId, { lastOpen: new Date() })
 
+            // Limpiar timers de reconexión y presencia anteriores
             if (this.reconnectTimers[lineId]) {
                 clearTimeout(this.reconnectTimers[lineId])
                 delete this.reconnectTimers[lineId]
@@ -215,23 +181,29 @@ async connect(phone) {
                 delete this.presenceIntervals[lineId]
             }
 
+            // Ping de presencia cada 3 minutos para mantener vivo a Baileys
             this.presenceIntervals[lineId] = setInterval(async () => {
                 try {
-                    if (this.campaignActive.get(lineId)) return
+                    // Evitar presence si hay una campaña masiva corriendo para no saturar
+                    if (this.campaignActive && this.campaignActive.get(lineId)) return
+                    
                     if (waClient?.ws?.readyState === 1) {
                         await waClient.sendPresenceUpdate('available')
                     }
                 } catch (e) {}
             }, 180000)
 
-            const ownerId = this.lineOwners.get(lineId)
+            // Notificar al Frontend
+            const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
             const payload = { lineId, status: 'CONECTADA', phone: maskPhone(phone) }
+            
             if (ownerId && this.io.emitToUser) {
                 this.io.emitToUser(ownerId, 'status', payload)
             } else {
                 this.io.emit('status', payload)
             }
 
+            // Actualizar Base de Datos
             await this.prisma.lineas_whatsapp.update({
                 where: { id: lineId },
                 data: { status: 'CONECTADA' }
@@ -239,33 +211,9 @@ async connect(phone) {
             return
         }
 
-        // ─── CERRADO ───
+        // ─── 3. EVENTO CERRADO / DESCONECTADO ───
         if (connection === 'close') {
-            const now = Date.now()
-            if (!this.disconnectHistory[lineId]) this.disconnectHistory[lineId] = []
-            this.disconnectHistory[lineId].push(now)
-            this.disconnectHistory[lineId] = this.disconnectHistory[lineId].filter(t => now - t < 600000)
-
-            if (this.disconnectHistory[lineId].length >= 3) {
-                console.log(`🚫 Circuit breaker: ${lineId} se desconectó 3 veces en 10 min. Deteniendo reconexiones.`)
-                this.sessionHealth.delete(lineId)
-                await this.prisma.lineas_whatsapp.update({
-                    where: { id: lineId },
-                    data: { status: 'DESCONECTADA' }
-                }).catch(() => {})
-                const ownerId = this.lineOwners.get(lineId)
-                const payload = { lineId, status: 'DESCONECTADA', reason: 'CIRCUIT_BREAKER', phone: maskPhone(phone) }
-                if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
-                else this.io.emit('status', payload)
-                return
-            }
-
-            const currentClient = this.clients.get(lineId)
-            if (currentClient && currentClient !== waClient) {
-                console.log(`🔄 Socket reemplazado para ${lineId}, ignorando close del socket viejo`)
-                return
-            }
-
+            // Limpiar el timer de presencia
             if (this.presenceIntervals[lineId]) {
                 clearInterval(this.presenceIntervals[lineId])
                 delete this.presenceIntervals[lineId]
@@ -273,81 +221,66 @@ async connect(phone) {
 
             const statusCode = lastDisconnect?.error?.output?.statusCode
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut
-            console.log(`❌ Desconectado ${lineId}. Razón: ${statusCode}`)
+            console.log(`❌ Desconectado ${lineId}. Razón (StatusCode): ${statusCode}`)
 
-            // 401: Sesión invalidada → limpiar auth y pedir QR
-            if (statusCode === 401) {
-                console.log(`🔒 Sesión invalidada (401): ${lineId}`)
-                this.sessionHealth.delete(lineId)
+            // A. LOGOUT REAL O SESIÓN INVALIDADA (401) -> Limpiar archivos
+            if (statusCode === 401 || !shouldReconnect) {
+                console.log(`🔒 Sesión invalidada o Logout definitivo: ${lineId}`)
+                
                 await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
                 this.clients.delete(lineId)
+                
                 await this.prisma.lineas_whatsapp.update({
                     where: { id: lineId },
                     data: { status: 'DESCONECTADA' }
                 }).catch(() => {})
 
-                const ownerId = this.lineOwners.get(lineId)
-                const payload = { lineId, status: 'DESCONECTADA', reason: 'SESSION_INVALID', phone: maskPhone(phone) }
+                const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
+                const payload = { 
+                    lineId, 
+                    status: 'DESCONECTADA', 
+                    reason: statusCode === 401 ? 'SESSION_INVALID' : 'LOGOUT', 
+                    phone: maskPhone(phone) 
+                }
+                
                 if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
                 else this.io.emit('status', payload)
+                
                 return
             }
 
-            // Logout permanente
-            if (!shouldReconnect) {
-                console.log(`⚠️ Logout permanente: ${lineId}`)
-                this.sessionHealth.delete(lineId)
-                await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
-                this.clients.delete(lineId)
-                await this.prisma.lineas_whatsapp.update({
-                    where: { id: lineId },
-                    data: { status: 'DESCONECTADA' }
-                }).catch(() => {})
-
-                const ownerId = this.lineOwners.get(lineId)
-                const payload = { lineId, status: 'DESCONECTADA', reason: 'LOGOUT', phone: maskPhone(phone) }
-                if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
-                else this.io.emit('status', payload)
-                return
-            }
-
-            // ─── CANCELLED por stopLine() ───
+            // B. APAGADO MANUAL (stopLine) -> No reconectar
             if (this.reconnectTimers[lineId] === 'CANCELLED') {
-                console.log(`⏹️ Reconexión bloqueada por stopLine: ${lineId}`)
-                this.sessionHealth.delete(lineId)
+                console.log(`⏹️ Reconexión abortada por el usuario (stopLine): ${lineId}`)
                 this.clients.delete(lineId)
+                
                 await this.prisma.lineas_whatsapp.update({
                     where: { id: lineId },
                     data: { status: 'DESCONECTADA' }
                 }).catch(() => {})
-                const ownerId = this.lineOwners.get(lineId)
+                
+                const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
                 const payload = { lineId, status: 'DESCONECTADA', reason: 'CANCELLED_BY_USER', phone: maskPhone(phone) }
                 if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
                 else this.io.emit('status', payload)
                 return
             }
 
-            // ─── CANCELLED por REVOKED (Meta) ───
-            if (this.reconnectTimers[lineId] === 'REVOKED') {
-                console.log(`⏹️ Reconexión bloqueada por sesión revocada: ${lineId}`)
-                this.clients.delete(lineId)
-                return
-            }
-
-            // ─── Desconexión temporal (428, 503, 440, 515) ───
-            console.log(`🔄 Reconexión temporal ${lineId}...`)
+            // C. RECONEXIÓN AUTOMÁTICA -> El sistema se recupera solo
+            console.log(`🔄 Iniciando reconexión automática para ${lineId}...`)
             this.clients.delete(lineId)
 
             if (this.reconnectTimers[lineId]) clearTimeout(this.reconnectTimers[lineId])
 
+            // Meta suele dar errores 503, 428 o 515 cuando sus servidores están saturados. Les damos 15s de respiro.
             const delay = (statusCode === 503 || statusCode === 428 || statusCode === 515) ? 15000 : 5000
 
             this.reconnectTimers[lineId] = setTimeout(() => {
-                if (this.reconnectTimers[lineId] === 'CANCELLED' || this.reconnectTimers[lineId] === 'REVOKED') {
-                    console.log(`⏹️ Reconexión abortada (${this.reconnectTimers[lineId]}): ${lineId}`)
+                if (this.reconnectTimers[lineId] === 'CANCELLED') {
+                    console.log(`⏹️ Reconexión abortada en el último segundo: ${lineId}`)
                     return
                 }
-                this.connect(phone).catch(e => console.error(`❌ Reconexión fallida ${lineId}:`, e))
+                this.connect(phone).catch(e => console.error(`❌ Reconexión fallida ${lineId}:`, e.message))
             }, delay)
         }
     })

@@ -2966,10 +2966,11 @@ cron.schedule('*/5 * * * *', async () => {
       const isDue = s.execute_at <= new Date()
       console.log(`   ${s.id} | camp:${s.campaign_id} | status:${s.status} | execute_at:${s.execute_at.toISOString()} | due:${isDue}`)
     }
-    
+
     const now = new Date()
     
 const nowWithMargin = new Date(now.getTime() + 60000) // +1 minuto de gracia
+    const twentyMinAgo = new Date(now.getTime() - 20 * 60 * 1000)
 
 const pending = await prisma.scheduled_campaigns.findMany({
   where: {
@@ -3175,56 +3176,52 @@ async function alertOwner(type, data) {
 }
 
 // Graceful shutdown: cerrar sockets Baileys antes de morir
-async function gracefulShutdown(signal) {
-  console.log(`\n🛑 ${signal} recibido. Cerrando ${waService.clients.size} sockets...`)
+// async function gracefulShutdown(signal) {
+//   console.log(`\n🛑 ${signal} recibido. Cerrando ${waService.clients.size} sockets...`)
   
-  // 1. MATAR SOCKET.IO PRIMERO (Vital para que el server no se cuelgue)
-  if (io) {
-    io.close() 
-  }
+//   if (io) {
+//     io.close() 
+//   }
 
-  const closePromises = []
-  for (const [lineId, client] of waService.clients.entries()) {
-    closePromises.push(
-      new Promise((resolve) => {
-        try {
-          // 2. USAR client.end() NO client.ws.close()
-          client.end(undefined) 
-          // Darle 3 segundos a Baileys para escribir el último creds.json
-          setTimeout(resolve, 3000)
-        } catch (e) {
-          resolve()
-        }
-      })
-    )
-  }
+//   const closePromises = []
+//   for (const [lineId, client] of waService.clients.entries()) {
+//     closePromises.push(
+//       new Promise((resolve) => {
+//         try {
+          
+//           client.end(undefined) 
+//           setTimeout(resolve, 3000)
+//         } catch (e) {
+//           resolve()
+//         }
+//       })
+//     )
+//   }
   
-  await Promise.all(closePromises)
+//   await Promise.all(closePromises)
   
-  // Limpiar timers
-  for (const [lineId, timer] of Object.entries(waService.reconnectTimers)) {
-    if (typeof timer === 'number') clearTimeout(timer)
-  }
-  for (const [lineId, interval] of Object.entries(waService.presenceIntervals)) {
-    if (typeof interval === 'number') clearInterval(interval)
-  }
+//   for (const [lineId, timer] of Object.entries(waService.reconnectTimers)) {
+//     if (typeof timer === 'number') clearTimeout(timer)
+//   }
+//   for (const [lineId, interval] of Object.entries(waService.presenceIntervals)) {
+//     if (typeof interval === 'number') clearInterval(interval)
+//   }
   
-  await prisma.$disconnect()
+//   await prisma.$disconnect()
   
-  server.close(() => {
-    console.log('✅ Servidor cerrado gracefulmente')
-    process.exit(0)
-  })
+//   server.close(() => {
+//     console.log('✅ Servidor cerrado gracefulmente')
+//     process.exit(0)
+//   })
   
-  // Reducimos el fallback a 5s, no 10s.
-  setTimeout(() => {
-    console.log('⚠️ Forzando salida después de 5s')
-    process.exit(0)
-  }, 5000)
-}
+//   setTimeout(() => {
+//     console.log('⚠️ Forzando salida después de 5s')
+//     process.exit(0)
+//   }, 5000)
+// }
 
- process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
-process.on('SIGINT', () => gracefulShutdown('SIGINT'))
+//  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+// process.on('SIGINT', () => gracefulShutdown('SIGINT'))
 
 // ============================================================
 // SERVER START
