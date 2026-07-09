@@ -1089,20 +1089,23 @@ app.post('/api/lineas/connect', authOrSecret, requireLicense, async (req, res) =
     if (force === true) {
       const line = await prisma.lineas_whatsapp.findUnique({ where: { phone } })
       if (line) {
+        // La ruta absoluta está perfecta apuntando al volumen de Railway
         const sessionPath = path.join('/app/sessions', String(line.id))
         await fs.remove(sessionPath).catch(() => {})
-        // Matar socket zombie si existe
+        
+        // Matar socket zombie si existe de forma segura
         const existing = waService.clients.get(line.id)
         if (existing) {
-          try { existing.ws?.close() } catch {}
+          try { existing.end(undefined) } catch {} // <-- El único cambio
           waService.clients.delete(line.id)
         }
+        
         // Limpiar timers
         if (waService.reconnectTimers[line.id]) {
           clearTimeout(waService.reconnectTimers[line.id])
           delete waService.reconnectTimers[line.id]
         }
-        console.log(`🧹 Sesión forzada limpiada: ${line.id}`)
+        console.log(`🧹 Sesión forzada limpiada manualmente por el usuario: ${line.id}`)
       }
     }
 
