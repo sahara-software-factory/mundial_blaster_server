@@ -308,3 +308,13 @@ model bases_datos {
   @@index([usuario_id])
 }
 
+model wa_sessions {
+  id        String   @id @default(cuid())
+  sessionId String   // Aquí guardaremos el lineId
+  key       String   // El nombre de la llave (creds, app-state, etc)
+  data      String   @db.Text // Los datos encriptados en formato JSON
+
+  @@unique([sessionId, key])
+  @@index([sessionId])
+}
+

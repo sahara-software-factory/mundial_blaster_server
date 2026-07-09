@@ -1,6 +1,5 @@
 const {
   makeWASocket,
-  useMultiFileAuthState,
   Browsers,
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -9,6 +8,7 @@ const {
   jidNormalizedUser
 } = require('@whiskeysockets/baileys')
 const pino = require('pino')
+const { usePrismaAuthState } = require('./usePrismaAuthState');
 const fs = require('fs-extra')
 const path = require('path')
 const QRCode = require('qrcode')
@@ -95,7 +95,7 @@ async connect(phone) {
     if (this.reconnectTimers[lineId] === 'CANCELLED') {
       delete this.reconnectTimers[lineId]
     }
-    const sessionPath = path.join(this.sessionsDir, String(lineId))
+   
     
     // Cerrar socket previo si quedó colgado (zombie)
     const existing = this.clients.get(lineId)
@@ -105,8 +105,8 @@ async connect(phone) {
       await new Promise(r => setTimeout(r, 500))
     }
 
-    await fs.ensureDir(sessionPath)
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath)
+  
+    const { state, saveCreds } = await usePrismaAuthState(this.prisma, lineId);
     const { version } = await fetchLatestBaileysVersion()
 
     const waClient = makeWASocket({
@@ -1009,10 +1009,13 @@ setupEvents(waClient, lineId, phone, saveCreds) {
       this.clients.delete(lineId)
     }
     try {
-      const sessionPath = path.join(this.sessionsDir, String(lineId))
-      if (fs.existsSync(sessionPath)) await fs.remove(sessionPath)
+      // Borramos directamente de Neon, sin importar si hay carpeta o no
+      await this.prisma.wa_sessions.deleteMany({ 
+          where: { sessionId: lineId } 
+      })
+      console.log(`🧹 Sesión eliminada de la base de datos para: ${lineId}`)
     } catch (e) {
-      console.log(`⚠️ No se pudo eliminar carpeta de sesión: ${e.message}`)
+      console.log(`⚠️ No se pudo eliminar la sesión de la DB: ${e.message}`)
     }
     try {
       const exists = await this.prisma.lineas_whatsapp.findUnique({ where: { id: lineId } })
