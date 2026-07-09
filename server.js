@@ -1076,7 +1076,7 @@ app.patch('/api/templates/:id/favorite', authOrSecret, loadTier, requireFeature(
   } catch (e) {
     console.error('Error toggle favorite:', e)
     res.status(500).json({ error: 'Error actualizando favorito' })
-  }
+   }
 })
 
 // ========== LÍNEAS ==========
