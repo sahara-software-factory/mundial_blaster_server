@@ -440,6 +440,20 @@ async function requireLicense(req, res, next) {
 const waService = new WAService(prisma, io, validateLicense, TIER_LIMITS)
 waService.init().catch(e => console.error('Init error:', e))
 
+// Health check cada 30 segundos: reconectar líneas CONECTADA sin socket
+setInterval(async () => {
+  try {
+    const lines = await prisma.lineas_whatsapp.findMany({ where: { status: 'CONECTADA' } })
+    for (const line of lines) {
+      const client = waService.clients.get(line.id)
+      if (!client?.user) {
+        console.log(`🩺 Health check: reconectando línea huérfana ${line.phone}`)
+        waService.connect(line.phone).catch(e => console.error('Health reconnect failed:', e.message))
+      }
+    }
+  } catch (e) {}
+}, 30000)
+
 io.on('connection', () => console.log('🟢 Socket conectado'))
 
 // ============================================================
@@ -1281,23 +1295,47 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
     const isNow = !isPending && !isScheduled
 
     // ─── SI ES ENVÍO INMEDIATO: verificar que estén conectadas AHORA ───
-     let lineasActivas = []
+        // ─── SI ES ENVÍO INMEDIATO: verificar que estén conectadas AHORA ───
+    let lineasActivas = []
     if (isNow) {
       for (const line of lineRecords) {
-        const client = waService.clients.get(line.id)
-        const isReallyConnected = client && !!client.user  // ← FIX: solo verificar user
+        let client = waService.clients.get(line.id)
+        
+        // 🔥 AUTO-RECONNECT: si no hay socket en memoria, intentar reconectar
+        if (!client || !client.user) {
+          console.log(`🔌 Línea ${line.phone} (${line.id}) sin socket en memoria. Intentando reconectar...`)
+          try {
+            await waService.connect(line.phone)
+            // Esperar a que Baileys autentique (max 5s)
+            for (let i = 0; i < 10; i++) {
+              await new Promise(r => setTimeout(r, 500))
+              client = waService.clients.get(line.id)
+              if (client?.user) break
+            }
+          } catch (e) {
+            console.error(`❌ Reconexión automática falló para ${line.phone}:`, e.message)
+          }
+        }
+        
+        const isReallyConnected = client && !!client.user
         
         if (isReallyConnected) {
           lineasActivas.push(line)
-          console.log(`      ✅ Línea ${line.phone} REALMENTE conectada`)
+          console.log(`      ✅ Línea ${line.phone} (${line.id}) conectada y lista`)
         } else {
-          console.log(`      ⚠️ Línea ${line.phone} no está conectada ahora (user:${!!client?.user})`)
+          console.log(`      ⚠️ Línea ${line.phone} (${line.id}) no conectada (user:${!!client?.user}, clientExists:${!!client})`)
         }
       }
+      
       if (lineasActivas.length === 0) {
-        return res.status(400).json({
-          error: 'Las líneas seleccionadas no están conectadas. Conectalas antes de enviar.',
-          lines: lineRecords.map(l => ({ id: l.id, phone: l.phone, status: l.status }))
+        return res.status(409).json({
+          error: 'Las líneas no están conectadas en este momento. Intentá reconectar desde el panel.',
+          lines: lineRecords.map(l => ({ 
+            id: l.id, 
+            phone: l.phone, 
+            dbStatus: l.status,
+            hint: 'Probá tocar "Conectar" en el panel y esperar 10 segundos'
+          }))
         })
       }
     }
