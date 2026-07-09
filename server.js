@@ -1281,16 +1281,17 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
     const isNow = !isPending && !isScheduled
 
     // ─── SI ES ENVÍO INMEDIATO: verificar que estén conectadas AHORA ───
-    let lineasActivas = []
+     let lineasActivas = []
     if (isNow) {
       for (const line of lineRecords) {
         const client = waService.clients.get(line.id)
-        const isReallyConnected = client && !!client.user
+        const isReallyConnected = client && !!client.user  // ← FIX: solo verificar user
+        
         if (isReallyConnected) {
           lineasActivas.push(line)
           console.log(`      ✅ Línea ${line.phone} REALMENTE conectada`)
         } else {
-          console.log(`      ⚠️ Línea ${line.phone} no está conectada ahora (user:${!!client?.user}, readyState:${client?.ws?.readyState})`)
+          console.log(`      ⚠️ Línea ${line.phone} no está conectada ahora (user:${!!client?.user})`)
         }
       }
       if (lineasActivas.length === 0) {
