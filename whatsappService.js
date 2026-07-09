@@ -109,7 +109,7 @@ async connect(phone) {
     const { state, saveCreds } = await usePrismaAuthState(this.prisma, lineId);
     const { version } = await fetchLatestBaileysVersion()
 
-    const waClient = makeWASocket({
+    const waClient = makeWASocket ({
       version,
       logger,
       printQRInTerminal: false,
