@@ -440,27 +440,7 @@ async function requireLicense(req, res, next) {
 const waService = new WAService(prisma, io, validateLicense, TIER_LIMITS)
 waService.init().catch(e => console.error('Init error:', e))
 
-// Health check cada 30 segundos: reconectar líneas CONECTADA sin socket
-setInterval(async () => {
-  try {
-    const lines = await prisma.lineas_whatsapp.findMany({ where: { status: 'CONECTADA' } })
-    for (const line of lines) {
-      const client = waService.clients.get(line.id)
-      
-      // Ya está conectada y autenticada
-      if (client?.user) continue
-      
-      // Ya está intentando conectar (timer activo o socket existente pero sin user aún)
-      if (waService.reconnectTimers[line.id] || waService.clients.has(line.id)) {
-        console.log(`⏳ Línea ${line.phone} ya reconectándose, skipping health check`)
-        continue
-      }
-      
-      console.log(`🩺 Health check: reconectando línea huérfana ${line.phone}`)
-      waService.connect(line.phone).catch(e => console.error('Health reconnect failed:', e.message))
-    }
-  } catch (e) {}
-}, 30000)
+
 io.on('connection', () => console.log('🟢 Socket conectado'))
 
 // ============================================================
