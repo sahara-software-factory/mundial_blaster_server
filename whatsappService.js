@@ -257,14 +257,17 @@ setupEvents(waClient, lineId, phone, saveCreds) {
 
     console.log(`❌ Desconectado ${lineId}. Razón: ${statusCode}`)
 
-    // ─── 401: SESIÓN INVALIDADA (logout o expirada) ───
+   // ─── 401: SESIÓN INVALIDADA (logout o expirada) ───
     if (isLoggedOut) {
         console.log(`🔒 Sesión invalidada (401): ${lineId}`)
         
-        // Limpiar disco efímero para forzar QR limpio en próxima conexión
-        await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
         this.clients.delete(lineId)
         this.sessionHealth.delete(lineId)
+        
+        // 🔥 ESTA ES LA CLAVE: Borramos las credenciales corruptas de NEON
+        await this.prisma.wa_sessions.deleteMany({ 
+            where: { sessionId: lineId } 
+        }).catch(() => {})
         
         await this.prisma.lineas_whatsapp.update({
             where: { id: lineId },

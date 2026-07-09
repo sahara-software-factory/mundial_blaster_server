@@ -3208,54 +3208,28 @@ async function alertOwner(type, data) {
   } catch (e) { /* Silencioso. Nunca falla. */ }
 }
 
-// Graceful shutdown: cerrar sockets Baileys antes de morir
-// async function gracefulShutdown(signal) {
-//   console.log(`\n🛑 ${signal} recibido. Cerrando ${waService.clients.size} sockets...`)
+// 🔥 Apagado Elegante EXCLUSIVO para guardar en Base de Datos
+async function gracefulShutdown(signal) {
+  console.log(`\n🛑 ${signal} recibido. Guardando últimas sesiones de Baileys en Neon...`)
   
-//   if (io) {
-//     io.close() 
-//   }
+  // 1. Avisamos a Baileys que se apague de forma segura (end)
+  for (const [lineId, client] of waService.clients.entries()) {
+    try {
+      client.end(undefined) 
+    } catch (e) {}
+  }
+  
+  // 2. Le damos EXACTAMENTE 3 segundos a Prisma para que suba los datos a Neon
+  await new Promise(resolve => setTimeout(resolve, 3000))
+  
+  // 3. Cerramos BD y morimos
+  await prisma.$disconnect()
+  console.log('✅ Base de datos guardada. Apagando contenedor.')
+  process.exit(0)
+}
 
-//   const closePromises = []
-//   for (const [lineId, client] of waService.clients.entries()) {
-//     closePromises.push(
-//       new Promise((resolve) => {
-//         try {
-          
-//           client.end(undefined) 
-//           setTimeout(resolve, 3000)
-//         } catch (e) {
-//           resolve()
-//         }
-//       })
-//     )
-//   }
-  
-//   await Promise.all(closePromises)
-  
-//   for (const [lineId, timer] of Object.entries(waService.reconnectTimers)) {
-//     if (typeof timer === 'number') clearTimeout(timer)
-//   }
-//   for (const [lineId, interval] of Object.entries(waService.presenceIntervals)) {
-//     if (typeof interval === 'number') clearInterval(interval)
-//   }
-  
-//   await prisma.$disconnect()
-  
-//   server.close(() => {
-//     console.log('✅ Servidor cerrado gracefulmente')
-//     process.exit(0)
-//   })
-  
-//   setTimeout(() => {
-//     console.log('⚠️ Forzando salida después de 5s')
-//     process.exit(0)
-//   }, 5000)
-// }
-
-//  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
-// process.on('SIGINT', () => gracefulShutdown('SIGINT'))
-
+ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.on('SIGINT', () => gracefulShutdown('SIGINT'))
 // ============================================================
 // SERVER START
 // ============================================================
