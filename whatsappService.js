@@ -137,9 +137,11 @@ async connect(phone) {
   }
 }
 
-  setupEvents(waClient, lineId, phone, saveCreds) {
+setupEvents(waClient, lineId, phone, saveCreds) {
+    // ─── GUARDADO DE CREDENCIALES ───
     waClient.ev.on('creds.update', saveCreds)
 
+    // ─── MANEJO DE CONEXIÓN Y ESTADO ───
     waClient.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update
 
@@ -162,7 +164,7 @@ async connect(phone) {
                 
                 console.log(`📱 QR emitido al frontend: ${lineId}`)
             } catch (e) {
-                console.error('Error generando QR:', e)
+                console.error('❌ Error generando QR:', e)
             }
             return
         }
@@ -171,8 +173,8 @@ async connect(phone) {
         if (connection === 'open') {
             console.log(`✅ Conectado: ${lineId}`)
 
-            // Limpiar timers de reconexión y presencia anteriores
-            if (this.reconnectTimers[lineId]) {
+            // Limpiar timers previos
+            if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] !== 'string') {
                 clearTimeout(this.reconnectTimers[lineId])
                 delete this.reconnectTimers[lineId]
             }
@@ -181,12 +183,10 @@ async connect(phone) {
                 delete this.presenceIntervals[lineId]
             }
 
-            // Ping de presencia cada 3 minutos para mantener vivo a Baileys
+            // Ping de presencia para mantener viva la conexión
             this.presenceIntervals[lineId] = setInterval(async () => {
                 try {
-                    // Evitar presence si hay una campaña masiva corriendo para no saturar
                     if (this.campaignActive && this.campaignActive.get(lineId)) return
-                    
                     if (waClient?.ws?.readyState === 1) {
                         await waClient.sendPresenceUpdate('available')
                     }
@@ -197,11 +197,8 @@ async connect(phone) {
             const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
             const payload = { lineId, status: 'CONECTADA', phone: maskPhone(phone) }
             
-            if (ownerId && this.io.emitToUser) {
-                this.io.emitToUser(ownerId, 'status', payload)
-            } else {
-                this.io.emit('status', payload)
-            }
+            if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
+            else this.io.emit('status', payload)
 
             // Actualizar Base de Datos
             await this.prisma.lineas_whatsapp.update({
@@ -220,14 +217,18 @@ async connect(phone) {
             }
 
             const statusCode = lastDisconnect?.error?.output?.statusCode
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut
-             console.log(`❌ Desconectado ${lineId}. Razón (StatusCode): ${statusCode}`)
+            
+            // DisconnectReason.loggedOut es exactamente 401
+            const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401
+            console.log(`❌ Desconectado ${lineId}. Razón (StatusCode): ${statusCode}`)
 
-            // A. LOGOUT REAL O SESIÓN INVALIDADA (401) -> Limpiar archivos
-            if (statusCode === 401 || !shouldReconnect) {
-                console.log(`🔒 Sesión invalidada o Logout definitivo: ${lineId}`)
+            // A. LOGOUT O CONFLICTO 401 (EL BLINDAJE FINAL)
+            if (isLoggedOut) {
+                console.log(`🔒 Sesión finalizada o invalidada por Meta (401): ${lineId}`)
                 
-                await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
+                // 🔥 NO HACEMOS fs.remove AQUÍ. 
+                // Si es un "fantasma" por el redeploy, la carpeta se salva y reconectamos manual.
+                // Si es un logout real, el botón del panel frontal se encargará de borrarla limpia.
                 this.clients.delete(lineId)
                 
                 await this.prisma.lineas_whatsapp.update({
@@ -239,7 +240,7 @@ async connect(phone) {
                 const payload = { 
                     lineId, 
                     status: 'DESCONECTADA', 
-                    reason: statusCode === 401 ? 'SESSION_INVALID' : 'LOGOUT', 
+                    reason: 'SESSION_INVALID', 
                     phone: maskPhone(phone) 
                 }
                 
@@ -266,11 +267,13 @@ async connect(phone) {
                 return
             }
 
-            // C. RECONEXIÓN AUTOMÁTICA -> El sistema se recupera solo
+            // C. RECONEXIÓN AUTOMÁTICA -> (Fallas de red, reinicios limpios)
             console.log(`🔄 Iniciando reconexión automática para ${lineId}...`)
             this.clients.delete(lineId)
 
-            if (this.reconnectTimers[lineId]) clearTimeout(this.reconnectTimers[lineId])
+            if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] !== 'string') {
+                clearTimeout(this.reconnectTimers[lineId])
+            }
 
             // Meta suele dar errores 503, 428 o 515 cuando sus servidores están saturados. Les damos 15s de respiro.
             const delay = (statusCode === 503 || statusCode === 428 || statusCode === 515) ? 15000 : 5000
@@ -285,7 +288,7 @@ async connect(phone) {
         }
     })
 
-    // ─── MENSAJES (sin cambios) ───
+    // ─── MENSAJES (Mantenemos tu lógica de upsert intacta) ───
     waClient.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return
         for (const msg of messages) {
@@ -329,6 +332,7 @@ async connect(phone) {
                 this._setLidCache(`${lineId}:${lidDetectado}`, fromPhone)
             }
 
+            // Lógica de Blacklist manual desde el teléfono de origen
             if (msg.key.fromMe) {
                 const cmd = messageBody.trim().toLowerCase()
                 let reason = null
@@ -383,11 +387,13 @@ async connect(phone) {
                 continue
             }
 
+            // Auto-blacklist por Keywords
             try {
                 const config = await this.prisma.app_config.findUnique({ where: { key: 'blacklist_keywords' } })
                 const keywords = config?.value ? JSON.parse(config.value) : ['basta', 'no molesten', 'no me interesa', 'no, gracias', 'eliminar', 'stop', 'darme de baja', 'no quiero que me envien mas mensajes']
                 const lowerBody = messageBody.toLowerCase()
                 const matched = keywords.find(k => lowerBody.includes(k.toLowerCase()))
+                
                 if (matched) {
                     const cleanPhone = fromPhone.replace(/\D/g, '')
                     const existing = await this.prisma.blacklist.findFirst({ where: { phone: cleanPhone } })
@@ -409,6 +415,7 @@ async connect(phone) {
                 console.error('Auto-blacklist error:', e)
             }
 
+            // Reporte de respuestas
             try {
                 const recentLog = await this.prisma.campaign_logs.findFirst({
                     where: {
@@ -442,11 +449,12 @@ async connect(phone) {
         }
     })
 
-    // ─── MESSAGES.UPDATE (sin cambios) ───
+    // ─── MESSAGES.UPDATE (Lectura / Entregado) ───
     waClient.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
             const { key, update: statusUpdate } = update
             if (!key.id || !key.remoteJid) continue
+            
             if (key.remoteJid.includes('@lid')) {
                 const lidClean = key.remoteJid.split('@')[0]
                 if (!this.lidCache.has(`${lineId}:${lidClean}`)) {
@@ -470,11 +478,13 @@ async connect(phone) {
             }
             const phone = await this.resolvePhoneFromJid(lineId, key.remoteJid)
             if (!phone) continue
+            
             const log = await this.prisma.campaign_logs.findFirst({
                 where: { contact_phone: phone, message_id: key.id },
                 orderBy: { created_at: 'desc' }
             })
             if (!log) continue
+            
             const ack = statusUpdate?.status || statusUpdate?.ack
             if (ack === 2 && !log.delivered_at) {
                 await this.prisma.campaign_logs.update({
@@ -491,7 +501,7 @@ async connect(phone) {
         }
     })
 
-    // ─── CONTACTS (sin cambios) ───
+    // ─── CONTACTS ───
     waClient.ev.on('contacts.upsert', async (contacts) => {
         for (const contact of contacts) {
             await this._storeLidMappingFromContact(lineId, contact).catch(() => {})
@@ -503,7 +513,7 @@ async connect(phone) {
             await this._storeLidMappingFromContact(lineId, update).catch(() => {})
         }
     })
-}
+  }
 
   cleanJid(jid) {
     if (!jid) return ''
