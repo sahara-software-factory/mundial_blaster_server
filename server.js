@@ -1237,12 +1237,12 @@ app.post('/api/lineas/stop', authOrSecret, requireLicense, async (req, res) => {
 app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (req, res) => {
   try {
     const body = req.body
-    console.log('📨 CAMPAÑA RECIBIDA:', { 
+    console.log('📨 CAMPAÑA RECIBIDA:', JSON.stringify( { 
       schedule: body.schedule, 
       execute_at: body.execute_at,
       hasTargets: !!body.targets?.length,
       hasLines: !!(body.line_ids?.length || body.line_id)
-    })
+    }))
 
     if (!body.message || !body.message.trim()) {
       return res.status(400).json({ error: 'El mensaje es obligatorio' })
@@ -2954,20 +2954,32 @@ cron.schedule('*/5 * * * *', async () => {
   const { utc, localShort } = logNow()
   console.log(`\n⏰ CRON START | Server: ${localShort} | UTC: ${utc}`)
 
-  try {
-    // 2. Buscar campañas pendientes + colgadas (processing hace > 20 min)
-    const now = new Date()
-    const twentyMinAgo = new Date(now.getTime() - 20 * 60 * 1000)
+  
 
-    const pending = await prisma.scheduled_campaigns.findMany({
-      where: {
-        OR: [
-          { status: 'pending', execute_at: { lte: now } },
-          { status: 'processing', execute_at: { lte: twentyMinAgo } } // colgadas por redeploy
-        ]
-      },
-      orderBy: { execute_at: 'asc' }
+  try {
+    const allScheduled = await prisma.scheduled_campaigns.findMany({
+      orderBy: { execute_at: 'asc' },
+      take: 20
     })
+    console.log(`📋 TOTAL scheduled_campaigns en DB: ${allScheduled.length}`)
+    for (const s of allScheduled) {
+      const isDue = s.execute_at <= new Date()
+      console.log(`   ${s.id} | camp:${s.campaign_id} | status:${s.status} | execute_at:${s.execute_at.toISOString()} | due:${isDue}`)
+    }
+    
+    const now = new Date()
+    
+const nowWithMargin = new Date(now.getTime() + 60000) // +1 minuto de gracia
+
+const pending = await prisma.scheduled_campaigns.findMany({
+  where: {
+    OR: [
+      { status: 'pending', execute_at: { lte: nowWithMargin } },
+      { status: 'processing', execute_at: { lte: twentyMinAgo } }
+    ]
+  }
+})
+
 
     console.log(`📊 Campañas elegibles: ${pending.length} (pending + colgadas)`)
     for (const p of pending) {
