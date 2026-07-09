@@ -446,14 +446,21 @@ setInterval(async () => {
     const lines = await prisma.lineas_whatsapp.findMany({ where: { status: 'CONECTADA' } })
     for (const line of lines) {
       const client = waService.clients.get(line.id)
-      if (!client?.user) {
-        console.log(`🩺 Health check: reconectando línea huérfana ${line.phone}`)
-        waService.connect(line.phone).catch(e => console.error('Health reconnect failed:', e.message))
+      
+      // Ya está conectada y autenticada
+      if (client?.user) continue
+      
+      // Ya está intentando conectar (timer activo o socket existente pero sin user aún)
+      if (waService.reconnectTimers[line.id] || waService.clients.has(line.id)) {
+        console.log(`⏳ Línea ${line.phone} ya reconectándose, skipping health check`)
+        continue
       }
+      
+      console.log(`🩺 Health check: reconectando línea huérfana ${line.phone}`)
+      waService.connect(line.phone).catch(e => console.error('Health reconnect failed:', e.message))
     }
   } catch (e) {}
 }, 30000)
-
 io.on('connection', () => console.log('🟢 Socket conectado'))
 
 // ============================================================
@@ -1307,11 +1314,11 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
           try {
             await waService.connect(line.phone)
             // Esperar a que Baileys autentique (max 5s)
-            for (let i = 0; i < 10; i++) {
-              await new Promise(r => setTimeout(r, 500))
-              client = waService.clients.get(line.id)
-              if (client?.user) break
-            }
+            for (let i = 0; i < 16; i++) {  // era 10, ahora 16
+  await new Promise(r => setTimeout(r, 500))
+  client = waService.clients.get(line.id)
+  if (client?.user) break
+}
           } catch (e) {
             console.error(`❌ Reconexión automática falló para ${line.phone}:`, e.message)
           }

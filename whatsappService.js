@@ -210,93 +210,124 @@ setupEvents(waClient, lineId, phone, saveCreds) {
 
         // ─── 3. EVENTO CERRADO / DESCONECTADO ───
         if (connection === 'close') {
-            // Limpiar el timer de presencia
-            if (this.presenceIntervals[lineId]) {
-                clearInterval(this.presenceIntervals[lineId])
-                delete this.presenceIntervals[lineId]
-            }
+    if (this.presenceIntervals[lineId]) {
+        clearInterval(this.presenceIntervals[lineId])
+        delete this.presenceIntervals[lineId]
+    }
 
-            const statusCode = lastDisconnect?.error?.output?.statusCode
+    const statusCode = lastDisconnect?.error?.output?.statusCode
+    const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401
 
-            if (statusCode === 440) {
-                console.log(`⚠️ Conexión reemplazada (440): Otra instancia robó la sesión de ${lineId}. Deteniendo reconexión en este nodo.`);
-                this.clients.delete(lineId);
-                
-                // Limpiamos los timers para que este servidor no intente pelear más
-                if (this.reconnectTimers[lineId]) clearTimeout(this.reconnectTimers[lineId]);
-                if (this.presenceIntervals[lineId]) clearInterval(this.presenceIntervals[lineId]);
-                
-                return; // Cortamos la ejecución aquí
-            }
-            
-            // DisconnectReason.loggedOut es exactamente 401
-            const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401
-            console.log(`❌ Desconectado ${lineId}. Razón (StatusCode): ${statusCode}`)
-
-            // A. LOGOUT O CONFLICTO 401 (EL BLINDAJE FINAL)
-            if (isLoggedOut) {
-                console.log(`🔒 Sesión finalizada o invalidada por Meta (401): ${lineId}`)
-                
-                // 🔥 NO HACEMOS fs.remove AQUÍ. 
-                // Si es un "fantasma" por el redeploy, la carpeta se salva y reconectamos manual.
-                // Si es un logout real, el botón del panel frontal se encargará de borrarla limpia.
-                this.clients.delete(lineId)
-                
-                await this.prisma.lineas_whatsapp.update({
-                    where: { id: lineId },
-                    data: { status: 'DESCONECTADA' }
-                }).catch(() => {})
-
-                const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
-                const payload = { 
-                    lineId, 
-                    status: 'DESCONECTADA', 
-                    reason: 'SESSION_INVALID', 
-                    phone: maskPhone(phone) 
-                }
-                
-                if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
-                else this.io.emit('status', payload)
-                
-                return
-            }
-
-            // B. APAGADO MANUAL (stopLine) -> No reconectar
-            if (this.reconnectTimers[lineId] === 'CANCELLED') {
-                console.log(`⏹️ Reconexión abortada por el usuario (stopLine): ${lineId}`)
-                this.clients.delete(lineId)
-                
-                await this.prisma.lineas_whatsapp.update({
-                    where: { id: lineId },
-                    data: { status: 'DESCONECTADA' }
-                }).catch(() => {})
-                
-                const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
-                const payload = { lineId, status: 'DESCONECTADA', reason: 'CANCELLED_BY_USER', phone: maskPhone(phone) }
-                if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
-                else this.io.emit('status', payload)
-                return
-            }
-
-            // C. RECONEXIÓN AUTOMÁTICA -> (Fallas de red, reinicios limpios)
-            console.log(`🔄 Iniciando reconexión automática para ${lineId}...`)
-            this.clients.delete(lineId)
-
-            if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] !== 'string') {
-                clearTimeout(this.reconnectTimers[lineId])
-            }
-
-            // Meta suele dar errores 503, 428 o 515 cuando sus servidores están saturados. Les damos 15s de respiro.
-            const delay = (statusCode === 503 || statusCode === 428 || statusCode === 515) ? 15000 : 5000
-
-            this.reconnectTimers[lineId] = setTimeout(() => {
-                if (this.reconnectTimers[lineId] === 'CANCELLED') {
-                    console.log(`⏹️ Reconexión abortada en el último segundo: ${lineId}`)
-                    return
-                }
-                this.connect(phone).catch(e => console.error(`❌ Reconexión fallida ${lineId}:`, e.message))
-            }, delay)
+    // ─── 440: CONEXIÓN REEMPLAZADA (otra instancia) ───
+    // Esto pasa cuando health check + reconexión automática compiten
+    if (statusCode === 440) {
+        console.log(`⚠️ Conexión reemplazada (440): ${lineId}. Otra instancia robó la sesión.`)
+        
+        // Limpiar todo para que este nodo no pelee más
+        this.clients.delete(lineId)
+        this.sessionHealth.delete(lineId)
+        if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] === 'number') {
+            clearTimeout(this.reconnectTimers[lineId])
         }
+        delete this.reconnectTimers[lineId]
+        
+        // Limpiar sesión del disco (aunque sea efímero, evita que Baileys lea basura)
+        await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
+        
+        // Actualizar DB para que el health check no intente reconectar
+        await this.prisma.lineas_whatsapp.update({
+            where: { id: lineId },
+            data: { status: 'DESCONECTADA' }
+        }).catch(() => {})
+        
+        // Notificar al frontend
+        const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
+        const payload = { 
+            lineId, 
+            status: 'DESCONECTADA', 
+            reason: 'CONNECTION_REPLACED', 
+            phone: maskPhone(phone),
+            message: 'Otra sesión conectó con este número. Reconectá desde el panel.'
+        }
+        if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
+        else this.io.emit('status', payload)
+        
+        return
+    }
+
+    console.log(`❌ Desconectado ${lineId}. Razón: ${statusCode}`)
+
+    // ─── 401: SESIÓN INVALIDADA (logout o expirada) ───
+    if (isLoggedOut) {
+        console.log(`🔒 Sesión invalidada (401): ${lineId}`)
+        
+        // Limpiar disco efímero para forzar QR limpio en próxima conexión
+        await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
+        this.clients.delete(lineId)
+        this.sessionHealth.delete(lineId)
+        
+        await this.prisma.lineas_whatsapp.update({
+            where: { id: lineId },
+            data: { status: 'DESCONECTADA' }
+        }).catch(() => {})
+
+        const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
+        const payload = { 
+            lineId, 
+            status: 'DESCONECTADA', 
+            reason: 'SESSION_INVALID', 
+            phone: maskPhone(phone) 
+        }
+        if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
+        else this.io.emit('status', payload)
+        
+        return
+    }
+
+    // ─── CANCELLED POR USUARIO (stopLine) ───
+    if (this.reconnectTimers[lineId] === 'CANCELLED') {
+        console.log(`⏹️ Reconexión abortada por stopLine: ${lineId}`)
+        this.clients.delete(lineId)
+        this.sessionHealth.delete(lineId)
+        
+        await this.prisma.lineas_whatsapp.update({
+            where: { id: lineId },
+            data: { status: 'DESCONECTADA' }
+        }).catch(() => {})
+        
+        const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
+        const payload = { lineId, status: 'DESCONECTADA', reason: 'CANCELLED_BY_USER', phone: maskPhone(phone) }
+        if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
+        else this.io.emit('status', payload)
+        return
+    }
+
+    // ─── REVOKED (Meta invalidó durante reconexión) ───
+    if (this.reconnectTimers[lineId] === 'REVOKED') {
+        console.log(`⏹️ Reconexión bloqueada por sesión revocada: ${lineId}`)
+        this.clients.delete(lineId)
+        return
+    }
+
+    // ─── RECONEXIÓN AUTOMÁTICA (fallas de red temporales) ───
+    console.log(`🔄 Reconexión temporal ${lineId}...`)
+    this.clients.delete(lineId)
+
+    // Anti-duplicado: si ya hay un timer corriendo, no crear otro
+    if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] === 'number') {
+        clearTimeout(this.reconnectTimers[lineId])
+    }
+
+    const delay = (statusCode === 503 || statusCode === 428 || statusCode === 515) ? 15000 : 5000
+
+    this.reconnectTimers[lineId] = setTimeout(() => {
+        if (this.reconnectTimers[lineId] === 'CANCELLED' || this.reconnectTimers[lineId] === 'REVOKED') {
+            console.log(`⏹️ Reconexión abortada (${this.reconnectTimers[lineId]}): ${lineId}`)
+            return
+        }
+        this.connect(phone).catch(e => console.error(`❌ Reconexión fallida ${lineId}:`, e.message))
+    }, delay)
+}
     })
 
     // ─── MENSAJES (Mantenemos tu lógica de upsert intacta) ───
