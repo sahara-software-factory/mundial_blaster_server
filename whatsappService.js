@@ -633,6 +633,17 @@ setupEvents(waClient, lineId, phone, saveCreds) {
   }
 
   async sendMessageHuman(lineId, contactPhone, content, options = {}) {
+   
+const hasRealText = content && content.trim().length > 5
+const shouldSimulateTyping = hasRealText || !imageUrl 
+
+if (shouldSimulateTyping) {
+  await waClient.sendPresenceUpdate('composing', jid)
+  const typingDelay = Math.min(8000, Math.max(3000, content.length * 100))
+  await new Promise(r => setTimeout(r, typingDelay))
+  await waClient.sendPresenceUpdate('paused', jid)
+  await new Promise(r => setTimeout(r, 500))
+}
     const waClient = this.clients.get(lineId) || this.clients.get(String(lineId))
     if (!waClient || !waClient.user) throw new Error('Línea no conectada')
     const cleanNumber = this.cleanJid(contactPhone)
@@ -641,7 +652,7 @@ setupEvents(waClient, lineId, phone, saveCreds) {
     console.log(`[HUMAN MODE] Iniciando typing para ${maskPhone(contactPhone)} → JID: ${jid}`)
     try {
       await waClient.sendPresenceUpdate('composing', jid)
-      const typingDelay = Math.min(8000, Math.max(2000, content.length * 50))
+      const typingDelay = Math.min(8000, Math.max(3000, content.length * 100))
       console.log(`[HUMAN MODE] ⏳ Esperando ${typingDelay}ms (${content.length} caracteres)`)
       await new Promise(r => setTimeout(r, typingDelay))
       await waClient.sendPresenceUpdate('paused', jid)
@@ -730,25 +741,26 @@ setupEvents(waClient, lineId, phone, saveCreds) {
         continue
       }
 
-      if (options.skipBlacklist) {
-        const cleanPhone = target.phone.replace(/\D/g, '')
-        const blacklisted = await this.prisma.blacklist.findFirst({
-          where: { phone: cleanPhone }
-        })
-        if (blacklisted) {
-          console.log(`⛔ Saltando ${maskPhone(target.phone)} — blacklist`)
-          await this.prisma.campaign_logs.create({
-            data: {
-              campaign_id: campaignId,
-              contact_phone: target.phone,
-              status: 'skipped_blacklist',
-              line_id: null,
-              owner_id: options.ownerId || null,
-            }
-          }).catch(() => {})
-          continue
-        }
+      const shouldCheckBlacklist = options.skipBlacklist !== false
+if (shouldCheckBlacklist) {
+  const cleanPhone = target.phone.replace(/\D/g, '')
+  const blacklisted = await this.prisma.blacklist.findFirst({
+    where: { phone: cleanPhone }
+  })
+  if (blacklisted) {
+    console.log(`⛔ Saltando ${maskPhone(target.phone)} — blacklist (reason: ${blacklisted.reason})`)
+    await this.prisma.campaign_logs.create({
+      data: {
+        campaign_id: campaignId,
+        contact_phone: target.phone,
+        status: 'skipped_blacklist',
+        line_id: null,
+        owner_id: options.ownerId || null,
       }
+    }).catch(() => {})
+    continue
+  }
+}
 
       try {
         const campaignStatus = await this.prisma.campaigns.findUnique({

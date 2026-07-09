@@ -1030,12 +1030,14 @@ app.post('/api/templates/:id/clone', authOrSecret, async (req, res) => {
       where: { id: req.params.id }
     })
     if (!original) return res.status(404).json({ error: 'Template no encontrado' })
+    
     const clone = await prisma.message_templates.create({
       data: {
         name: `${original.name} (copia)`,
         content: original.content,
         category: original.category,
         variables: original.variables,
+        imageUrl: original.imageUrl, 
         usageCount: 0,
         owner_id: req.user?.id || null
       }
@@ -1429,7 +1431,7 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       delayMax: body.delay_max || 25000,
       imageUrl: body.image_url || null,
       humanMode: body.human_mode === true,
-      skipBlacklist: body.skipBlacklist === true,
+      skipBlacklist: body.skipBlacklist !== false,
       ownerId: req.user?.id || null
     }
 
@@ -3109,7 +3111,7 @@ const pending = await prisma.scheduled_campaigns.findMany({
           delayMax: 25000,
           imageUrl: campaign.image_url,
           humanMode: campaign.human_mode === true,
-          skipBlacklist: true,
+          sskipBlacklist: body.skipBlacklist !== false,
           ownerId: campaign.owner_id || null
         }
 
