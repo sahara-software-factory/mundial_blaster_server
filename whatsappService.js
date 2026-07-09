@@ -221,7 +221,7 @@ async connect(phone) {
 
             const statusCode = lastDisconnect?.error?.output?.statusCode
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut
-            console.log(`❌ Desconectado ${lineId}. Razón (StatusCode): ${statusCode}`)
+             console.log(`❌ Desconectado ${lineId}. Razón (StatusCode): ${statusCode}`)
 
             // A. LOGOUT REAL O SESIÓN INVALIDADA (401) -> Limpiar archivos
             if (statusCode === 401 || !shouldReconnect) {
