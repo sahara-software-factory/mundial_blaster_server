@@ -217,6 +217,17 @@ setupEvents(waClient, lineId, phone, saveCreds) {
             }
 
             const statusCode = lastDisconnect?.error?.output?.statusCode
+
+            if (statusCode === 440) {
+                console.log(`⚠️ Conexión reemplazada (440): Otra instancia robó la sesión de ${lineId}. Deteniendo reconexión en este nodo.`);
+                this.clients.delete(lineId);
+                
+                // Limpiamos los timers para que este servidor no intente pelear más
+                if (this.reconnectTimers[lineId]) clearTimeout(this.reconnectTimers[lineId]);
+                if (this.presenceIntervals[lineId]) clearInterval(this.presenceIntervals[lineId]);
+                
+                return; // Cortamos la ejecución aquí
+            }
             
             // DisconnectReason.loggedOut es exactamente 401
             const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401
