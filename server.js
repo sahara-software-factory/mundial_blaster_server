@@ -2417,7 +2417,7 @@ app.post('/api/ai/summary', authOrSecret, loadTier, requireFeature('hasAI'), asy
     res.status(500).json({ error: 'Error generando resumen' })
   }
 })
-app.use('/api/ai', aiRouter)
+// app.use('/api/ai', aiRouter)
 
 // OpenAI Config (también blindado por hasAI)
 app.get('/api/openai/config', authOrSecret, loadTier, requireFeature('hasAI'), async (req, res) => {
