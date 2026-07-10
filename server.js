@@ -2143,7 +2143,7 @@ app.delete('/api/blacklist/:phone', authOrSecret, loadTier, requireFeature('hasB
 const aiRouter = express.Router()
 aiRouter.use(authOrSecret, loadTier, requireFeature('hasAI'))
 
-aiRouter.get('/prompts', async (req, res) => {
+aiRouter.get('/api/ai/prompts', async (req, res) => {
   try {
     const where = req.user?.id ? { OR: [{ owner_id: req.user.id }, { owner_id: null }] } : {}
     const prompts = await prisma.ai_prompts.findMany({
@@ -2157,7 +2157,7 @@ aiRouter.get('/prompts', async (req, res) => {
   }
 })
 
-aiRouter.post('/prompts', async (req, res) => {
+aiRouter.post('/api/ai/prompts', async (req, res) => {
   try {
     const { title, instruction, results } = req.body
     if (!title || !instruction) {
@@ -2178,7 +2178,7 @@ aiRouter.post('/prompts', async (req, res) => {
   }
 })
 
-aiRouter.delete('/prompts/:id', async (req, res) => {
+aiRouter.delete('/api/ai/prompts/:id', async (req, res) => {
   try {
     if (!req.user?.id) return res.status(401).json({ error: 'Requiere sesión de usuario' })
     await prisma.ai_prompts.delete({
@@ -2191,7 +2191,7 @@ aiRouter.delete('/prompts/:id', async (req, res) => {
   }
 })
 
-aiRouter.post('/generate', async (req, res) => {
+aiRouter.post('/api/ai/generate', async (req, res) => {
   try {
     const { instruction, temperature = 0.85, maxTokens = 1200 } = req.body
     if (!instruction?.trim()) return res.status(400).json({ error: 'Instrucción requerida' })
@@ -2245,7 +2245,7 @@ REGLAS OBLIGATORIAS:
   }
 })
 
-aiRouter.post('/audit', async (req, res) => {
+aiRouter.post('/api/ai/audit', async (req, res) => {
   try {
     const { message } = req.body
     if (!message) return res.status(400).json({ error: 'Mensaje requerido' })
@@ -2305,7 +2305,7 @@ aiRouter.post('/audit', async (req, res) => {
   }
 })
 
-aiRouter.post('/title', async (req, res) => {
+aiRouter.post('/api/ai/title', async (req, res) => {
   try {
     const { message } = req.body
     if (!message) return res.status(400).json({ error: 'Mensaje requerido' })
@@ -2341,7 +2341,7 @@ aiRouter.post('/title', async (req, res) => {
   }
 })
 
-aiRouter.get('/estimate', async (req, res) => {
+aiRouter.get('/api/ai/estimate', async (req, res) => {
   try {
     const startOfMonth = new Date()
     startOfMonth.setDate(1)
@@ -2367,7 +2367,7 @@ aiRouter.get('/estimate', async (req, res) => {
   }
 })
 
-aiRouter.post('/summary', async (req, res) => {
+aiRouter.post('/api/ai/summary', async (req, res) => {
   console.log('🎯 ENTRÓ a /api/ai/summary', req.body)
   try {
     const { campaignId, sent, failed, total } = req.body

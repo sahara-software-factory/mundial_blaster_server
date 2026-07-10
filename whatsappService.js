@@ -394,23 +394,23 @@ setupEvents(waClient, lineId, phone, saveCreds) {
                 this._setLidCache(`${lineId}:${lidDetectado}`, fromPhone)
             }
 
-            // Lógica de Blacklist manual desde el teléfono de origen
+            // ─── 1. LÓGICA DE BLACKLIST MANUAL (Operador Ninja) ───
             if (msg.key.fromMe) {
                 const cmd = messageBody.trim().toLowerCase()
                 let reason = null
-                if (cmd === '!blacklist' || cmd.startsWith('!blacklist ')) {
-                    reason = cmd.replace('!blacklist', '').trim() || 'manual desde chat'
-                } else if (cmd === 'comprobante falso' || cmd === 'falso') {
-                    reason = 'comprobante falso'
-                } else if (cmd === 'spam') {
-                    reason = 'spam'
-                } else if (cmd === 'ban') {
-                    reason = 'ban manual'
-                } else if (cmd === 'estafa') {
-                    reason = 'estafa'
-                } else if (cmd === 'no') {
-                    reason = 'rechazado por operador'
+
+                // A. Modo Rápido: El operador manda solo un emoji de bloqueo
+                if (['🚫', '⛔', '🔇'].includes(cmd)) {
+                    reason = 'bloqueo_rapido_emoji'
                 }
+                // B. Modo Educado: El operador usa una frase natural, el cliente la lee, y el sistema actúa
+                else if (cmd.includes('te doy de baja') || cmd.includes('te elimino de la base') || cmd.includes('no te escribimos más') || cmd.includes('te borro de la lista')) {
+                    reason = 'baja_amable_operador'
+                }
+                // C. Modo Etiquetado Silencioso: Usar un punto al final para disimular (ej: "falso.")
+                else if (cmd === '.falso' || cmd === 'falso.') reason = 'comprobante falso'
+                else if (cmd === '.spam' || cmd === 'spam.') reason = 'spam'
+                else if (cmd === '.estafa' || cmd === 'estafa.') reason = 'estafa'
 
                 if (reason && fromPhone) {
                     try {
@@ -429,7 +429,8 @@ setupEvents(waClient, lineId, phone, saveCreds) {
                                 data: { phone: cleanPhone, reason, owner_id: null }
                             })
                         }
-                        console.log(`🛡️ Operador marcó blacklist: ${maskPhone(cleanPhone)} → ${reason}`)
+                        console.log(`🛡️ Operador Ninja marcó blacklist: ${maskPhone(cleanPhone)} → ${reason}`)
+                        
                         const ownerId = entry?.owner_id || this.lineOwners.get(lineId) || null
                         const payload = { 
                             phone: cleanPhone, 
@@ -449,24 +450,43 @@ setupEvents(waClient, lineId, phone, saveCreds) {
                 continue
             }
 
-            // Auto-blacklist por Keywords
+            // ─── 2. AUTO-BLACKLIST POR KEYWORDS (La Cúpula de Hierro) ───
             try {
                 const config = await this.prisma.app_config.findUnique({ where: { key: 'blacklist_keywords' } })
-                const keywords = config?.value ? JSON.parse(config.value) : ['basta', 'no molesten', 'no me interesa', 'no, gracias', 'eliminar', 'stop', 'darme de baja', 'no quiero que me envien mas mensajes']
+                
+                // Diccionario pesado de contingencia
+                const defaultKeywords = [
+                    // Educados
+                    'no me interesa', 'no gracias', 'no, gracias', 'no quiero', 'paso,', 'paso gracias',
+                    // Directos
+                    'basta', 'stop', 'darme de baja', 'eliminar', 'no mandes', 'no escribas', 'sacame de', 'borrame', 'desuscribir', 'bloquear', 'denunciar',
+                    // Enojados / Modismos (Argentina/LatAm)
+                    'romper las bolas', 'rompiendo las bolas', 'hinchar los huevos', 'hinchando los huevos', 'no jodan', 'dejen de joder', 'no me jodas', 'vayanse a cagar', 'váyanse a cagar', 'pesados', 'harto', 'cansado', 'pelotudos', 'quien te paso', 'quien les paso', 'de donde sacaste', 'metete el',
+                    // Emojis de rechazo
+                    '🖕', '🛑', '🚫'
+                ]
+                
+                const keywords = config?.value ? JSON.parse(config.value) : defaultKeywords
                 const lowerBody = messageBody.toLowerCase()
+                
+                // Buscamos si alguna keyword coincide dentro del texto del cliente
                 const matched = keywords.find(k => lowerBody.includes(k.toLowerCase()))
                 
                 if (matched) {
                     const cleanPhone = fromPhone.replace(/\D/g, '')
                     const existing = await this.prisma.blacklist.findFirst({ where: { phone: cleanPhone } })
+                    
                     if (existing) {
                         await this.prisma.blacklist.update({ where: { id: existing.id }, data: { reason: `auto: "${matched}"` } })
                     } else {
                         await this.prisma.blacklist.create({ data: { phone: cleanPhone, reason: `auto: "${matched}"`, owner_id: null } })
                     }
-                    console.log(`🚫 Auto-blacklist: ${maskPhone(cleanPhone)} por keyword "${matched}"`)
+                    
+                    console.log(`🚫 Auto-blacklist activado: ${maskPhone(cleanPhone)} por keyword "${matched}"`)
+                    
                     const ownerId = this.lineOwners.get(lineId) || null
                     const payload = { phone: cleanPhone, keyword: matched, timestamp: new Date() }
+                    
                     if (ownerId && this.io.emitToUser) {
                         this.io.emitToUser(ownerId, 'auto_blacklist', payload)
                     } else {
