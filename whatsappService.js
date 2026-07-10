@@ -61,6 +61,10 @@ class WAService {
 
 async init() {
   console.log('✅ WabiSend WAService inicializado')
+  if (process.env.CONNECT_WHATSAPP_ON_START === 'false') {
+      console.log('⚠️ Autoconexión deshabilitada en entorno local.')
+      return 
+  }
   try {
     const lines = await this.prisma.lineas_whatsapp.findMany().catch(e => {
       console.error('⚠️ DB lineas_whatsapp no accesible:', e.message)
@@ -679,56 +683,7 @@ setupEvents(waClient, lineId, phone, saveCreds) {
     }
   }
 
-  async sendMessageHuman(lineId, contactPhone, content, options = {}) {
-   
-const hasRealText = content && content.trim().length > 5
-const shouldSimulateTyping = hasRealText || !imageUrl 
 
-if (shouldSimulateTyping) {
-  await waClient.sendPresenceUpdate('composing', jid)
-  const typingDelay = Math.min(8000, Math.max(3000, content.length * 100))
-  await new Promise(r => setTimeout(r, typingDelay))
-  await waClient.sendPresenceUpdate('paused', jid)
-  await new Promise(r => setTimeout(r, 500))
-}
-    const waClient = this.clients.get(lineId) || this.clients.get(String(lineId))
-    if (!waClient || !waClient.user) throw new Error('Línea no conectada')
-    const cleanNumber = this.cleanJid(contactPhone)
-    const isGroup = cleanNumber.length > 15
-    const jid = isGroup ? `${cleanNumber}@g.us` : `${cleanNumber}@s.whatsapp.net`
-    console.log(`[HUMAN MODE] Iniciando typing para ${maskPhone(contactPhone)} → JID: ${jid}`)
-    try {
-      await waClient.sendPresenceUpdate('composing', jid)
-      const typingDelay = Math.min(8000, Math.max(3000, content.length * 100))
-      console.log(`[HUMAN MODE] ⏳ Esperando ${typingDelay}ms (${content.length} caracteres)`)
-      await new Promise(r => setTimeout(r, typingDelay))
-      await waClient.sendPresenceUpdate('paused', jid)
-      await new Promise(r => setTimeout(r, 500))
-      const { type = 'text', imageUrl = null } = options
-      let messagePayload = {}
-      if (type === 'image' && imageUrl) {
-        messagePayload = { image: { url: imageUrl }, caption: content || '' }
-      } else {
-        messagePayload = { text: content }
-      }
-      const sentMsg = await waClient.sendMessage(jid, messagePayload)
-      if (sentMsg?.key?.remoteJid?.includes('@lid')) {
-        const lid = sentMsg.key.remoteJid.split('@')[0]
-        this._setLidCache(`${lineId}:${lid}`, cleanNumber)
-        await this.prisma.lid_mappings.upsert({
-          where: { lineId_lid: { lineId, lid } },
-          update: { phone: cleanNumber, updatedAt: new Date() },
-          create: { lineId, lid, phone: cleanNumber }
-        }).catch(() => {})
-        console.log(`🔗 LID capturado al enviar (human): ${lid} → ${maskPhone(cleanNumber)}`)
-      }
-      console.log(`[HUMAN MODE] ✅ Mensaje enviado`)
-      return { success: true, messageId: sentMsg?.key?.id }
-    } catch (err) {
-      console.error(`[HUMAN MODE] ❌ Error:`, err.message)
-      throw err
-    }
-  }
 
   async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
   // 🔐 INLINE LICENSE CHECK
@@ -1061,6 +1016,67 @@ if (shouldCheckBlacklist) {
 
   return results
 }
+
+
+  async sendMessageHuman(lineId, contactPhone, content, options = {}) {
+    // 1. INICIALIZAR Y VALIDAR CLIENTE (Esto siempre va primero)
+    const waClient = this.clients.get(lineId) || this.clients.get(String(lineId))
+    if (!waClient || !waClient.user) throw new Error('Línea no conectada')
+
+    // 2. EXTRAER OPCIONES Y ARMAR EL JID
+    const { type = 'text', imageUrl = null } = options
+    const cleanNumber = this.cleanJid(contactPhone)
+    const isGroup = cleanNumber.length > 15
+    const jid = isGroup ? `${cleanNumber}@g.us` : `${cleanNumber}@s.whatsapp.net`
+    
+    console.log(`[HUMAN MODE] Iniciando typing para ${contactPhone} → JID: ${jid}`)
+    
+    try {
+      // 3. SIMULAR ESCRITURA HUMANA
+      const hasRealText = content && content.trim().length > 0
+      const shouldSimulateTyping = hasRealText || !imageUrl 
+
+      if (shouldSimulateTyping) {
+        await waClient.sendPresenceUpdate('composing', jid)
+        // Calcula el delay de typing basado en la longitud (entre 3 y 8 segundos)
+        const typingDelay = Math.min(8000, Math.max(3000, (content || '').length * 100))
+        console.log(`[HUMAN MODE] ⏳ Esperando ${typingDelay}ms`)
+        
+        await new Promise(r => setTimeout(r, typingDelay))
+        await waClient.sendPresenceUpdate('paused', jid)
+        await new Promise(r => setTimeout(r, 500))
+      }
+
+      // 4. ARMAR EL PAYLOAD Y ENVIAR
+      let messagePayload = {}
+      if (type === 'image' && imageUrl) {
+        messagePayload = { image: { url: imageUrl }, caption: content || '' }
+      } else {
+        messagePayload = { text: content }
+      }
+      
+      const sentMsg = await waClient.sendMessage(jid, messagePayload)
+      
+      // 5. CAZADOR DE LIDs (Para tracking posterior)
+      if (sentMsg?.key?.remoteJid?.includes('@lid')) {
+        const lid = sentMsg.key.remoteJid.split('@')[0]
+        this._setLidCache(`${lineId}:${lid}`, cleanNumber)
+        await this.prisma.lid_mappings.upsert({
+          where: { lineId_lid: { lineId, lid } },
+          update: { phone: cleanNumber, updatedAt: new Date() },
+          create: { lineId, lid, phone: cleanNumber }
+        }).catch(() => {})
+        console.log(`🔗 LID capturado al enviar (human): ${lid} → ${cleanNumber}`)
+      }
+      
+      console.log(`[HUMAN MODE] ✅ Mensaje enviado exitosamente`)
+      return { success: true, messageId: sentMsg?.key?.id }
+      
+    } catch (err) {
+      console.error(`[HUMAN MODE] ❌ Error:`, err.message)
+      throw err
+    }
+  }
 
       async logout(lineId) {
     if (this.reconnectTimers[lineId]) {
