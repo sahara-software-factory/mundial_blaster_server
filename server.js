@@ -283,7 +283,8 @@ const TIER_LIMITS = {
     hasCron: false,
     hasExport: false,
     hasRoundRobin: false,
-    hasHumanMode: false,
+    hasHumanMode: true,
+    humanModeMaxLines: 1,
     hasClone: false,
     hasAdvancedSpintax: false,
     hasTemplateVars: false,
@@ -302,6 +303,7 @@ const TIER_LIMITS = {
     hasExport: true,
     hasRoundRobin: true,
     hasHumanMode: true,
+    humanModeMaxLines: 2,
     hasClone: true,
     hasAdvancedSpintax: true,
     hasTemplateVars: true,
@@ -320,6 +322,7 @@ const TIER_LIMITS = {
     hasExport: true,
     hasRoundRobin: true,
     hasHumanMode: true,
+    humanModeMaxLines: Infinity,
     hasClone: true,
     hasAdvancedSpintax: true,
     hasTemplateVars: true,
@@ -1363,9 +1366,16 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
         tier: req.tier,
       })
     }
-    if (body.human_mode && !req.tierConfig.hasHumanMode) {
+        if (body.human_mode && !req.tierConfig.hasHumanMode) {
       return res.status(403).json({
-        error: 'Modo humano disponible solo en plan Pro y Business.',
+        error: 'Modo humano no disponible en tu plan.',
+        tier: req.tier,
+      })
+    }
+    // ─── HUMAN MODE: 1 línea en Starter/Pro, ilimitado en Business ───
+    if (body.human_mode && req.tierConfig.humanModeMaxLines && lineRecords.length > req.tierConfig.humanModeMaxLines) {
+      return res.status(403).json({
+        error: `Modo humano permite hasta ${req.tierConfig.humanModeMaxLines} línea(s) en plan ${req.tierConfig.label}. Para usarlo con múltiples líneas necesitás Business.`,
         tier: req.tier,
       })
     }

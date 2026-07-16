@@ -712,12 +712,16 @@ setupEvents(waClient, lineId, phone, saveCreds) {
   const license = this.validateLicense(licenseConfig.value)
   if (!license) throw new Error('LICENSE_INVALID')
 
-  // Verificar tier para features avanzadas
-  if (options.humanMode && license.tier === 'starter') throw new Error('TIER_UPGRADE_REQUIRED')
-  if (options.imageUrl && license.tier === 'starter') throw new Error('TIER_UPGRADE_REQUIRED')
+if (options.imageUrl && license.tier === 'starter') throw new Error('TIER_UPGRADE_REQUIRED')
 
   // Defaults conservadores (15-25s) para evitar bans
-  const { delayMin = 15000, delayMax = 25000, imageUrl = null } = options
+  let { delayMin = 15000, delayMax = 25000, imageUrl = null } = options
+
+  // Starter + humanMode: delay mínimo 8s forzado (protege su única línea)
+  if (options.humanMode && license.tier === 'starter') {
+    delayMin = Math.max(delayMin, 8000)
+    delayMax = Math.max(delayMax, delayMin + 2000)
+  }
 
   let lineasActivas = []
   if (Array.isArray(lineInput)) {
@@ -734,8 +738,13 @@ setupEvents(waClient, lineId, phone, saveCreds) {
     if (lineInput.status === 'CONECTADA' && client && client.user) lineasActivas = [lineInput]
   }
 
-  if (lineasActivas.length === 0) {
+    if (lineasActivas.length === 0) {
     throw new Error('No hay líneas conectadas y autenticadas disponibles para enviar')
+  }
+
+  // ─── HUMAN MODE: límite de líneas por tier (Business ilimitado) ───
+  if (options.humanMode && license.tier !== 'business' && lineasActivas.length > 1) {
+    throw new Error('HUMAN_MODE_SINGLE_LINE_ONLY')
   }
 
   // ─── ACTIVAR FLAG ANTI-PRESENCE (después de filtrar líneas) ───
