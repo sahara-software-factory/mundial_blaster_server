@@ -3289,7 +3289,7 @@ async function gracefulShutdown(signal) {
   process.exit(0)
 }
 
- process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
 process.on('SIGINT', () => gracefulShutdown('SIGINT'))
 // ============================================================
 // SERVER START
