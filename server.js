@@ -12,7 +12,7 @@ const bcrypt = require('bcryptjs')
 const cron = require('node-cron')
 const { DateTime } = require('luxon')
 const crypto = require('crypto')
-
+const { clearRamCache } = require('./usePrismaAuthState');
 // Seguridad: npm install helmet express-rate-limit
 const helmet = require('helmet')
 const rateLimit = require('express-rate-limit')
@@ -441,7 +441,11 @@ async function requireLicense(req, res, next) {
 // WHATSAPP SERVICE
 // ============================================================
 const waService = new WAService(prisma, io, validateLicense, TIER_LIMITS)
-waService.init().catch(e => console.error('Init error:', e))
+const { loadBaileys } = require('./whatsappService')
+// ...
+loadBaileys()
+  .then(() => waService.init())
+  .catch(e => console.error('💥 Falló carga de Baileys:', e))
 
 
 io.on('connection', () => console.log('🟢 Socket conectado'))
@@ -450,6 +454,10 @@ io.on('connection', () => console.log('🟢 Socket conectado'))
 // RUTAS
 // ============================================================
 app.get('/', (_, res) => res.json({ status: 'OK', service: 'Wabisend', version: '3.2.0' }))
+
+
+
+
 
 // ========== AUTH ==========
 app.post('/api/auth/register', requireLicense, async (req, res) => {
@@ -1087,10 +1095,11 @@ app.patch('/api/templates/:id/favorite', authOrSecret, loadTier, requireFeature(
 
 // ========== LÍNEAS ==========
 app.post('/api/lineas/connect', authOrSecret, requireLicense, async (req, res) => {
-  const { phone, force } = req.body
+  const { phone, force, method  } = req.body
   if (!phone) return res.status(400).json({ error: 'phone required' })
   
   try {
+        // Si el usuario fuerza (desde el modal), limpiar sesión corrupta primero
     // Si el usuario fuerza (desde el modal), limpiar sesión corrupta primero
     if (force === true) {
       const line = await prisma.lineas_whatsapp.findUnique({ where: { phone } })
@@ -1101,23 +1110,33 @@ app.post('/api/lineas/connect', authOrSecret, requireLicense, async (req, res) =
              where: { sessionId: line.id }
         }).catch(() => {})
         
-        // 2. Matar socket zombie si existe de forma segura
+        // 🔥 1.5. BORRAR LLAVES DE LA RAM GLOBAL (El cortocircuito arreglado)
+        clearRamCache(line.id);
+        
+        // 2. Matar socket (vivo o zombie — el force es destructivo por definición)
         const existing = waService.clients.get(line.id)
         if (existing) {
+          try { existing.ev.removeAllListeners() } catch {}
           try { existing.end(undefined) } catch {} 
           waService.clients.delete(line.id)
         }
+        
+        // 2b. Liberar TODOS los candados y flags de la línea
+        waService.connectingLines?.delete(line.id)
+        waService.connectingLocks?.delete(line.id)
+        waService.pairingMode?.delete(line.id)
+        waService.pairingCodeIssued?.delete(line.id)
         
         // 3. Limpiar timers
         if (waService.reconnectTimers[line.id]) {
           clearTimeout(waService.reconnectTimers[line.id])
           delete waService.reconnectTimers[line.id]
         }
-        console.log(`🧹 Sesión forzada limpiada manualmente en Neon por el usuario: ${line.id}`)
+        console.log(`🧹 Sesión forzada limpiada manualmente en Neon y RAM: ${line.id}`)
       }
     }
 
-    const line = await waService.connect(phone)
+    const line = await waService.connect(phone, { method: method || 'qr' })
     if (!line) {
       return res.status(409).json({ 
         error: 'No se pudo conectar la línea. Verificá que esté registrada o que no haya errores de sesión.' 
@@ -1244,6 +1263,19 @@ app.post('/api/lineas/stop', authOrSecret, requireLicense, async (req, res) => {
   }
 })
 
+
+app.get('/api/wa/check-number/:lineId/:phone', authOrSecret, async (req, res) => {
+  const client = waService.clients.get(req.params.lineId)
+  if (!client?.user) return res.status(409).json({ error: 'Línea no conectada' })
+  const phone = req.params.phone.replace(/\D/g, '')
+  try {
+    const result = await client.onWhatsApp(`${phone}@s.whatsapp.net`)
+    res.json({ phone, result }) // result[0].exists = true/false
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
 // ========== CAMPAÑAS ==========
 app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (req, res) => {
   try {
@@ -1292,22 +1324,24 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
         let client = waService.clients.get(line.id)
         
         // 🔥 AUTO-RECONNECT: si no hay socket en memoria, intentar reconectar
-        if (!client || !client.user) {
+      if (!client || !client.user) {
           console.log(`🔌 Línea ${line.phone} (${line.id}) sin socket en memoria. Intentando reconectar...`)
           try {
-            await waService.connect(line.phone)
-            // Esperar a que Baileys autentique (max 5s)
-            for (let i = 0; i < 16; i++) {  // era 10, ahora 16
-  await new Promise(r => setTimeout(r, 500))
-  client = waService.clients.get(line.id)
-  if (client?.user) break
-}
+             await waService.connect(line.phone)
+            // Esperar a que Baileys abra sesión (máx 20s)
+            for (let i = 0; i < 40; i++) {
+              await new Promise(r => setTimeout(r, 500))
+              client = waService.clients.get(line.id)
+              if (client?.user) break   // ✅ user = open completado
+            }
           } catch (e) {
             console.error(`❌ Reconexión automática falló para ${line.phone}:`, e.message)
           }
         }
         
-        const isReallyConnected = client && !!client.user
+                const isReallyConnected = !!client && !!client.user
+
+
         
         if (isReallyConnected) {
           lineasActivas.push(line)
@@ -1340,7 +1374,7 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       const userId = req.user?.id || null
       const pendingCount = await prisma.campaigns.count({
         where: {
-          status: 'pending',
+          status: isNow ? 'running' : 'pending',
           ...(userId ? { OR: [{ owner_id: userId }, { owner_id: null }] } : {})
         }
       })
@@ -1381,6 +1415,13 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
     }
 
     const allowedImageUrl = req.tierConfig?.hasTemplateVars ? body.image_url : null
+     const seenPhones = new Set()
+    const cleanTargets = body.targets.filter(t => {
+      const p = (t.phone || '').replace(/\D/g, '')
+      if (!p || seenPhones.has(p)) return false
+      seenPhones.add(p)
+      return true
+    })
 
     const newCampaign = await prisma.campaigns.create({
       data: {
@@ -1388,11 +1429,11 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
         name: body.name || `Campaña ${new Date().toLocaleDateString('es-AR')}`,
         message: body.message.trim(),
         image_url: allowedImageUrl || body.image_url || null,
-        total: body.targets.length,
+        total: cleanTargets.length,
         sent: 0,
         failed: 0,
         status: 'pending', // ← siempre pending al crear, el cron o el start la cambian
-        targets: body.targets,
+        targets: cleanTargets,
         distribution_mode: isRoundRobin ? 'round_robin' : 'single',
         line_id: linesToSave[0]?.id || lineRecords[0]?.id || '',
         selected_lines: JSON.stringify(lineRecords.map(l => l.id)),
@@ -1477,9 +1518,15 @@ app.post('/api/campaigns/send', authOrSecret, requireLicense, loadTier, async (r
       data: { status: 'running' }
     }).catch(() => {})
 
-    waService.sendCampaign(newCampaign.id, lineasActivas, body.targets, body.message.trim(), sendOptions)
+        waService.sendCampaign(newCampaign.id, lineasActivas,cleanTargets, body.message.trim(), sendOptions)
       .then(() => console.log(`✅ Campaña ${newCampaign.id} finalizada`))
-      .catch(err => console.error(`❌ Campaña ${newCampaign.id} falló:`, err))
+      .catch(async err => {
+        console.error(`❌ Campaña ${newCampaign.id} falló:`, err)
+        await prisma.campaigns.update({
+          where: { id: newCampaign.id },
+          data: { status: 'failed', finished_at: new Date() }
+        }).catch(() => {})
+      })
 
     res.status(201).json({
       success: true,

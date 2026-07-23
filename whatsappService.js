@@ -1,12 +1,25 @@
-const {
-  makeWASocket,
-  Browsers,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
-  jidDecode,
-  jidNormalizedUser
-} = require('@whiskeysockets/baileys')
+let makeWASocket, Browsers, DisconnectReason, fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore, jidDecode, jidNormalizedUser,
+    initAuthCreds, BufferJSON, proto
+
+async function loadBaileys() {
+  const b = await import('@whiskeysockets/baileys')
+  // Mergear default + named exports: los named exports tienen prioridad
+  const d = { ...(b.default && typeof b.default === 'object' ? b.default : {}), ...b }
+  ;({ makeWASocket, Browsers, DisconnectReason, fetchLatestBaileysVersion,
+      makeCacheableSignalKeyStore, jidDecode, jidNormalizedUser,
+      initAuthCreds, BufferJSON, proto } = d)
+  
+  // Verificación: avisar si alguna pieza crítica quedó undefined
+  const faltantes = Object.entries({ makeWASocket, DisconnectReason, initAuthCreds, BufferJSON, proto, makeCacheableSignalKeyStore })
+    .filter(([, v]) => !v).map(([k]) => k)
+  if (faltantes.length) {
+    console.error(`⚠️ Baileys cargó INCOMPLETO. Faltan: ${faltantes.join(', ')}`)
+    console.error('Keys disponibles:', Object.keys(d).join(', '))
+  } else {
+    console.log('📦 Baileys cargado (ESM dinámico) — todas las piezas OK')
+  }
+}
 const pino = require('pino')
 const { usePrismaAuthState } = require('./usePrismaAuthState');
 const fs = require('fs-extra')
@@ -38,6 +51,7 @@ class WAService {
     this.tierLimits = tierLimits || {}
     this.clients = new Map()
     this.connectingLocks = new Set()
+    this.connectingLines = new Set()        // ← AGREGAR
     this.reconnectTimers = {}
     this.presenceIntervals = {}
     this.sessionsDir = '/app/sessions'
@@ -47,6 +61,9 @@ class WAService {
     this.campaignActive = new Map()
     this.sessionHealth = new Map()
     this.disconnectHistory = {} 
+    this.pairingMode = new Map()
+    this.pairingCodeIssued = new Set()
+    this.outgoingMessagesCache = new NodeCache({ stdTTL: 3600 })
     this.maxLidCacheSize = 5000
     fs.ensureDirSync(this.sessionsDir)
   }
@@ -84,15 +101,29 @@ async init() {
   }
 }
 
-async connect(phone) {
+async connect(phone, options = {}) {
+  let line = null  // ← declarada AFUERA del try para que el catch la vea
   try {
-    let line = await this.prisma.lineas_whatsapp.findUnique({ where: { phone } })
+    line = await this.prisma.lineas_whatsapp.findUnique({ where: { phone } })
     if (!line) {
       console.warn(`⚠️ Línea no registrada: ${phone}`)
       return null
     }
 
     const lineId = line.id
+    console.log(`📞 connect() llamado para ${lineId} desde:`, new Error().stack?.split('\n')[2]?.trim())
+
+     this.connectingLines = this.connectingLines || new Set()
+    if (this.connectingLines.has(lineId)) {
+        console.log(`⏳ Ya hay un connect() en curso para ${lineId}, ignorando duplicado`)
+        return null
+    }
+    this.connectingLines.add(lineId)
+
+    this.pairingMode = this.pairingMode || new Map()
+    this.pairingMode.set(lineId, options.method === 'code')
+    this.pairingCodeIssued = this.pairingCodeIssued || new Set()
+    this.pairingCodeIssued.delete(lineId)
 
     // 🔥 EL CANDADO ANTI-CLONES: Evita que el frontend dispare esto 2 veces seguidas
     if (this.connectingLocks.has(lineId)) {
@@ -110,15 +141,26 @@ async connect(phone) {
     }
     
     // Cerrar socket previo si quedó colgado (zombie)
+           // Socket previo: si está VIVO, reutilizar — jamás matar una sesión sana
     const existing = this.clients.get(lineId)
     if (existing) {
-      try { existing.end(undefined) } catch {} // Usamos end() en lugar de close()
+      const isAlive = !!existing.user || existing?.ws?.readyState === 1
+      if (isAlive) {
+        console.log(`✅ Socket ya vivo para ${lineId} — se reutiliza, no se toca`)
+        this.connectingLines?.delete(lineId)
+        this.connectingLocks.delete(lineId)
+        return line
+      }
+      // Zombie real (socket muerto/colgado): recién acá matar
+      console.log(`🧟 Zombie real detectado en ${lineId}, reemplazando`)
+      try { existing.ev.removeAllListeners() } catch {}
+      try { existing.end(undefined) } catch {}
       this.clients.delete(lineId)
       await new Promise(r => setTimeout(r, 500))
     }
 
     // Usar la Base de Datos Neon (PostgreSQL)
-    const { state, saveCreds } = await usePrismaAuthState(this.prisma, lineId);
+     const { state, saveCreds } = await usePrismaAuthState(this.prisma, lineId, { initAuthCreds, BufferJSON, proto });
     const { version } = await fetchLatestBaileysVersion()
 
     const waClient = makeWASocket({
@@ -129,9 +171,14 @@ async connect(phone) {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger),
       },
-      browser: ['WabiSend', 'Chrome', '120.0.0'],
+      browser: Browsers.macOS('Chrome'),
       msgRetryCounterCache: this.msgRetryCounterCache,
-      getMessage: async (key) => ({ conversation: 'WabiSend' }),
+      getMessage: async (key) => {
+    // Baileys pide el mensaje original para reenvíos (retry receipts)
+    const cached = this.outgoingMessagesCache.get(key.id)
+    if (cached) return cached
+    return { conversation: 'WabiSend' } // fallback
+},
       markOnlineOnConnect: false,
       syncFullHistory: false,
       connectTimeoutMs: 60000,
@@ -148,8 +195,11 @@ async connect(phone) {
 
   } catch (err) {
     console.error('❌ Error connect:', err)
-    // Importante: Si hay error, quitamos el candado para que no quede bloqueado
-    if (line) this.connectingLocks.delete(line.id)
+    // Importante: Si hay error, liberamos AMBOS candados para que no quede bloqueado
+    if (line) {
+      this.connectingLocks.delete(line.id)
+      this.connectingLines?.delete(line.id)
+    }
     return null
   }
 }
@@ -164,6 +214,28 @@ setupEvents(waClient, lineId, phone, saveCreds) {
 
         // ─── 1. EVENTO QR (LIMPIO: Sin autodestrucción) ───
         if (qr) {
+
+           if (this.pairingMode?.get(lineId)) {
+        // 👇 NUEVO: solo UN código por intento — los qr events siguientes se ignoran
+        if (this.pairingCodeIssued.has(lineId)) return
+        this.pairingCodeIssued.add(lineId)
+
+        try {
+            const cleanPhone = phone.replace(/\D/g, '')
+            const code = await waClient.requestPairingCode(cleanPhone)
+            const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
+            const payload = { lineId, code }
+            if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'pairing_code', payload)
+            else this.io.emit('pairing_code', payload)
+            console.log(`🔢 Pairing code emitido: ${lineId} → ${code}`)
+        } catch (e) {
+            console.error(`❌ requestPairingCode falló (${lineId}):`, e.message)
+            this.pairingCodeIssued.delete(lineId) // si falló, permitir reintento
+            this.pairingMode.set(lineId, false)   // fallback a QR
+        }
+        return
+    }
+
             try {
                 const qrDataUrl = await QRCode.toDataURL(qr)
                 const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
@@ -188,7 +260,12 @@ setupEvents(waClient, lineId, phone, saveCreds) {
 
         // ─── 2. EVENTO CONECTADO ───
         if (connection === 'open') {
+          
             console.log(`✅ Conectado: ${lineId}`)
+            saveCreds() // persistir creds finales post-pairing
+            this.pairingCodeIssued?.delete(lineId)
+            this.connectingLines?.delete(lineId)   // ← FALTA ESTE: liberar candado anti-doble-vuelo
+            this.connectingLocks.delete(lineId)
 
             // Limpiar timers previos
             if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] !== 'string') {
@@ -227,13 +304,27 @@ setupEvents(waClient, lineId, phone, saveCreds) {
 
         // ─── 3. EVENTO CERRADO / DESCONECTADO ───
         if (connection === 'close') {
+
+this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la razón
+
+    // Cierre "limpio" sin error = lo provocamos nosotros (end() manual/force). No reconectar.
+    const statusCode = lastDisconnect?.error?.output?.statusCode
+
+    if (!statusCode) {
+        console.log(`⏹️ Cierre sin código (manual/propio): ${lineId}`)
+        return
+    }
+
     if (this.presenceIntervals[lineId]) {
         clearInterval(this.presenceIntervals[lineId])
         delete this.presenceIntervals[lineId]
     }
 
-    const statusCode = lastDisconnect?.error?.output?.statusCode
-    const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401
+    // 401 = sesión invalidada · 403 = sesión rechazada/cuenta baneada → ambos FATALES
+    console.log(`[ERR] Disconnect ${lineId} payload:`,
+            JSON.stringify(lastDisconnect?.error?.output?.payload || lastDisconnect?.error))
+            
+    const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403
 
     // ─── 440: CONEXIÓN REEMPLAZADA (otra instancia) ───
     // Esto pasa cuando health check + reconexión automática compiten
@@ -276,33 +367,42 @@ setupEvents(waClient, lineId, phone, saveCreds) {
 
    // ─── 401: SESIÓN INVALIDADA (logout o expirada) ───
     if (isLoggedOut) {
-        console.log(`🔒 Sesión invalidada (401): ${lineId}`)
-        
-        this.clients.delete(lineId)
-        this.sessionHealth.delete(lineId)
-        
-        // 🔥 ESTA ES LA CLAVE: Borramos las credenciales corruptas de NEON
-        await this.prisma.wa_sessions.deleteMany({ 
-            where: { sessionId: lineId } 
-        }).catch(() => {})
-        
+    this.connectingLines?.delete(lineId)
+    this.clients.delete(lineId)
+    this.sessionHealth.delete(lineId)
+
+    const payloadMsg = lastDisconnect?.error?.output?.payload?.message || ''
+    const isConflict = payloadMsg.includes('conflict') || payloadMsg.includes('replaced')
+
+    if (isConflict) {
+        // ⚠️ CONFLICT: otro stream compitió. Las creds PUEDEN seguir válidas → NO borrar sesión
+        console.log(`⚠️ Conflict en ${lineId} — sesión preservada, reconexión manual disponible`)
         await this.prisma.lineas_whatsapp.update({
             where: { id: lineId },
             data: { status: 'DESCONECTADA' }
         }).catch(() => {})
 
         const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
-        const payload = { 
-            lineId, 
-            status: 'DESCONECTADA', 
-            reason: 'SESSION_INVALID', 
-            phone: maskPhone(phone) 
-        }
+        const payload = { lineId, status: 'DESCONECTADA', reason: 'CONFLICT', phone: maskPhone(phone) }
         if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
         else this.io.emit('status', payload)
-        
         return
     }
+
+    // 🔒 Logout real (device_removed / baneo): recién acá borramos
+    console.log(`🔒 Sesión revocada por Meta: ${lineId}`)
+    await this.prisma.wa_sessions.deleteMany({ where: { sessionId: lineId } }).catch(() => {})
+    await this.prisma.lineas_whatsapp.update({
+        where: { id: lineId },
+        data: { status: 'DESCONECTADA' }
+    }).catch(() => {})
+
+    const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
+    const payload = { lineId, status: 'DESCONECTADA', reason: 'SESSION_INVALID', phone: maskPhone(phone) }
+    if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
+    else this.io.emit('status', payload)
+    return
+}
 
     // ─── CANCELLED POR USUARIO (stopLine) ───
     if (this.reconnectTimers[lineId] === 'CANCELLED') {
@@ -330,6 +430,7 @@ setupEvents(waClient, lineId, phone, saveCreds) {
     }
 
     // ─── RECONEXIÓN AUTOMÁTICA (fallas de red temporales) ───
+     // ─── RECONEXIÓN AUTOMÁTICA (fallas de red temporales) ───
     console.log(`🔄 Reconexión temporal ${lineId}...`)
     this.clients.delete(lineId)
 
@@ -345,7 +446,8 @@ setupEvents(waClient, lineId, phone, saveCreds) {
             console.log(`⏹️ Reconexión abortada (${this.reconnectTimers[lineId]}): ${lineId}`)
             return
         }
-        this.connect(phone).catch(e => console.error(`❌ Reconexión fallida ${lineId}:`, e.message))
+        this.connect(phone, { method: this.pairingMode?.get(lineId) ? 'code' : 'qr' })
+            .catch(e => console.error(`❌ Reconexión fallida ${lineId}:`, e.message))
     }, delay)
 }
     })
@@ -355,6 +457,8 @@ setupEvents(waClient, lineId, phone, saveCreds) {
         if (type !== 'notify') return
         for (const msg of messages) {
             if (!msg.message) continue
+            const remoteJid = msg.key.remoteJid || ''
+  if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast')) continue
             const messageBody = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
             const raw = msg.key.remoteJid
             const alt = msg.key.remoteJidAlt
@@ -676,9 +780,60 @@ setupEvents(waClient, lineId, phone, saveCreds) {
     let waClient = this.clients.get(lineId) || this.clients.get(String(lineId))
     if (!waClient || !waClient.user) throw new Error('Línea no conectada')
     try {
-      const cleanNumber = this.cleanJid(contactPhone)
+            const cleanNumber = this.cleanJid(contactPhone)
       const isGroup = cleanNumber.length > 15
-      const jid = isGroup ? `${cleanNumber}@g.us` : `${cleanNumber}@s.whatsapp.net`
+      let jid = isGroup ? `${cleanNumber}@g.us` : `${cleanNumber}@s.whatsapp.net`
+
+      // ─── RESOLVER JID REAL (Evita mensajes fantasma) ───
+      if (!isGroup) {
+        try {
+          // 1. ¿Ya tenemos el mapeo en caché/DB?
+          const known = await this.prisma.lid_mappings.findFirst({
+            where: { lineId, phone: cleanNumber }
+          })
+          
+          if (known?.lid) {
+            jid = `${known.lid}@lid`
+          } else {
+            // 2. Método nativo e infalible de Baileys
+            console.log(`🔍 Verificando número en WhatsApp: ${cleanNumber}...`)
+            const [result] = await waClient.onWhatsApp(cleanNumber)
+            
+                        if (result && result.exists) {
+              jid = result.jid
+              console.log(`✅ JID exacto resuelto por Meta: ${jid}`)
+              if (jid.includes('@lid')) {   // ← opcional: persistir para no re-consultar
+                const lidClean = jid.split('@')[0]
+                this._setLidCache(`${lineId}:${lidClean}`, cleanNumber)
+                await this.prisma.lid_mappings.upsert({
+                  where: { lineId_lid: { lineId, lid: lidClean } },
+                  update: { phone: cleanNumber, updatedAt: new Date() },
+                  create: { lineId, lid: lidClean, phone: cleanNumber }
+                }).catch(() => {})
+              }
+            } else {
+              console.log(`⚠️ El número ${cleanNumber} no tiene WhatsApp.`)
+              throw new Error('El número no existe en WhatsApp')
+            }
+          }
+        } catch (e) {
+          if (e.message === 'El número no existe en WhatsApp') throw e;
+          console.warn(`⚠️ Error consultando onWhatsApp para ${cleanNumber}, usando fallback:`, e.message)
+        }
+      }
+
+      if (!isGroup) {
+          try {
+              console.log(`🔥 Calentando túnel criptográfico para ${jid}...`)
+              await waClient.presenceSubscribe(jid)
+              await waClient.profilePictureUrl(jid).catch(() => {})
+              await new Promise(r => setTimeout(r, 600)) // Micro-pausa vital para que Meta sincronice
+          } catch (e) {
+              console.log(`⚠️ Warm-up silencioso (ignorar): ${e.message}`)
+          }
+      }
+
+
       let messagePayload = {}
       if (type === 'image' && imageUrl) {
         messagePayload = { image: { url: imageUrl }, caption: content || '' }
@@ -686,6 +841,12 @@ setupEvents(waClient, lineId, phone, saveCreds) {
         messagePayload = { text: content }
       }
       const sentMsg = await waClient.sendMessage(jid, messagePayload)
+      
+      // Guardar el protocolo nativo para que Baileys pueda reenviarlo si el destinatario pide retry
+      if (sentMsg?.key?.id && sentMsg.message) {
+          this.outgoingMessagesCache.set(sentMsg.key.id, sentMsg.message)
+      }
+
       if (sentMsg?.key?.remoteJid?.includes('@lid')) {
         const lid = sentMsg.key.remoteJid.split('@')[0]
         this._setLidCache(`${lineId}:${lid}`, cleanNumber)
@@ -743,8 +904,9 @@ if (options.imageUrl && license.tier === 'starter') throw new Error('TIER_UPGRAD
   }
 
   // ─── HUMAN MODE: límite de líneas por tier (Business ilimitado) ───
-  if (options.humanMode && license.tier !== 'business' && lineasActivas.length > 1) {
-    throw new Error('HUMAN_MODE_SINGLE_LINE_ONLY')
+  const hmMaxLines = license.tier === 'business' ? Infinity : license.tier === 'pro' ? 2 : 1
+  if (options.humanMode && lineasActivas.length > hmMaxLines) {
+    throw new Error('HUMAN_MODE_MAX_LINES_EXCEEDED')
   }
 
   // ─── ACTIVAR FLAG ANTI-PRESENCE (después de filtrar líneas) ───
@@ -1085,6 +1247,9 @@ if (shouldCheckBlacklist) {
       }
       
       const sentMsg = await waClient.sendMessage(jid, messagePayload)
+      if (sentMsg?.key?.id && sentMsg.message) {
+          this.outgoingMessagesCache.set(sentMsg.key.id, sentMsg.message)
+      }
       
       // 5. CAZADOR DE LIDs (Para tracking posterior)
       if (sentMsg?.key?.remoteJid?.includes('@lid')) {
@@ -1180,4 +1345,4 @@ if (shouldCheckBlacklist) {
 
 
 
-module.exports = { WAService }
+module.exports = { WAService, loadBaileys }
