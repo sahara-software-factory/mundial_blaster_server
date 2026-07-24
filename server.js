@@ -1253,7 +1253,7 @@ app.delete('/api/lineas/:id', authOrSecret, requireLicense, async (req, res) => 
   }
 })
 
-app.get('/api/lineas/:id/health', auth, async (req, res) => {
+app.get('/api/lineas/:id/health', authOrSecret, requireLicense, async (req, res) => {
     const desde = new Date(Date.now() - 7 * 86400000)
     const dias = await prisma.line_health_daily.findMany({
         where: { line_id: req.params.id, date: { gte: desde } }
