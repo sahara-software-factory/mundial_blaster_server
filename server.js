@@ -1163,6 +1163,8 @@ app.get('/api/lineas', authOrSecret, requireLicense, async (req, res) => {
   }
 })
 
+
+
 app.post('/api/lineas', authOrSecret, requireLicense, loadTier, async (req, res) => {
   const { phone, nombre } = req.body
   if (!phone) return res.status(400).json({ error: 'phone required' })
@@ -1249,6 +1251,19 @@ app.delete('/api/lineas/:id', authOrSecret, requireLicense, async (req, res) => 
     console.error('Error eliminando línea:', e)
     res.status(500).json({ error: 'Error eliminando línea' })
   }
+})
+
+app.get('/api/lineas/:id/health', auth, async (req, res) => {
+    const desde = new Date(Date.now() - 7 * 86400000)
+    const dias = await prisma.line_health_daily.findMany({
+        where: { line_id: req.params.id, date: { gte: desde } }
+    })
+    const diasActivos = dias.filter(d => d.human_msgs_out > 0).length
+    const humanOut = dias.reduce((a, d) => a + d.human_msgs_out, 0)
+    const msgIn = dias.reduce((a, d) => a + d.msgs_in, 0)
+    const score = (diasActivos >= 5 && humanOut >= 30) ? 'verde'
+                : (diasActivos >= 2) ? 'amarillo' : 'rojo'
+    res.json({ score, diasActivos, humanOut, msgIn, dias })
 })
 
 app.post('/api/lineas/stop', authOrSecret, requireLicense, async (req, res) => {
@@ -3289,7 +3304,7 @@ async function gracefulShutdown(signal) {
   process.exit(0)
 }
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
 process.on('SIGINT', () => gracefulShutdown('SIGINT'))
 // ============================================================
 // SERVER START

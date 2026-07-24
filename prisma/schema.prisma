@@ -318,3 +318,14 @@ model wa_sessions {
   @@index([sessionId])
 }
 
+
+model line_health_daily {
+  id             String   @id @default(uuid())
+  line_id        String
+  date           DateTime @db.Date
+  human_msgs_out Int      @default(0)  // mensajes que el humano mandó desde su celu (fromMe)
+  msgs_in        Int      @default(0)  // entrantes recibidos
+  replies        Int      @default(0)  // respuestas a campañas
+  updated_at     DateTime @updatedAt
+  @@unique([line_id, date])
+}

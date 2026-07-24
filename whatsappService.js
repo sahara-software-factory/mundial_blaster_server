@@ -43,6 +43,8 @@ function maskPhone(p) {
   return p.slice(0, 3) + '****' + p.slice(-2)
 }
 
+
+
 class WAService {
    constructor(prisma, io, validateLicenseFn, tierLimits) {
     this.prisma = prisma
@@ -56,6 +58,7 @@ class WAService {
     this.presenceIntervals = {}
     this.sessionsDir = '/app/sessions'
     this.msgRetryCounterCache = new NodeCache()
+    this.pendingAcks = new Map()
     this.lidCache = new Map()
     this.lineOwners = new Map()
     this.campaignActive = new Map()
@@ -101,6 +104,18 @@ async init() {
   }
 }
 
+async _trackLineActivity(lineId, field) {
+    try {
+        const today = new Date()
+        today.setHours(0, 0, 0, 0)
+        await this.prisma.line_health_daily.upsert({
+            where: { line_id_date: { line_id: lineId, date: today } },
+            update: { [field]: { increment: 1 } },
+            create: { line_id: lineId, date: today, [field]: 1 }
+        })
+    } catch (e) { /* silencioso: métricas nunca rompen el flujo */ }
+}
+
 async connect(phone, options = {}) {
   let line = null  // ← declarada AFUERA del try para que el catch la vea
   try {
@@ -136,9 +151,9 @@ async connect(phone, options = {}) {
     this.lineOwners.set(lineId, ownerId)
     
     // Limpiar flag CANCELLED si existe
-    if (this.reconnectTimers[lineId] === 'CANCELLED') {
-      delete this.reconnectTimers[lineId]
-    }
+    if (this.reconnectTimers[lineId] === 'CANCELLED' || this.reconnectTimers[lineId] === 'REVOKED') {
+  delete this.reconnectTimers[lineId]
+}
     
     // Cerrar socket previo si quedó colgado (zombie)
            // Socket previo: si está VIVO, reutilizar — jamás matar una sesión sana
@@ -151,6 +166,17 @@ async connect(phone, options = {}) {
         this.connectingLocks.delete(lineId)
         return line
       }
+
+      if (this.campaignActive.get(lineId)) {
+        const existing = this.clients.get(lineId)
+        if (existing?.user) {
+            console.log(`✅ Campaña activa con socket vivo en ${lineId} — no se toca`)
+            this.connectingLines?.delete(lineId)
+            this.connectingLocks.delete(lineId)
+            return line
+        }
+        console.log(`🩺 Campaña activa pero socket muerto en ${lineId} — autosanador permitido`)
+    }
       // Zombie real (socket muerto/colgado): recién acá matar
       console.log(`🧟 Zombie real detectado en ${lineId}, reemplazando`)
       try { existing.ev.removeAllListeners() } catch {}
@@ -216,7 +242,7 @@ setupEvents(waClient, lineId, phone, saveCreds) {
         if (qr) {
 
            if (this.pairingMode?.get(lineId)) {
-        // 👇 NUEVO: solo UN código por intento — los qr events siguientes se ignoran
+        // 👇 solo UN código por intento — los qr events siguientes se ignoran
         if (this.pairingCodeIssued.has(lineId)) return
         this.pairingCodeIssued.add(lineId)
 
@@ -264,7 +290,7 @@ setupEvents(waClient, lineId, phone, saveCreds) {
             console.log(`✅ Conectado: ${lineId}`)
             saveCreds() // persistir creds finales post-pairing
             this.pairingCodeIssued?.delete(lineId)
-            this.connectingLines?.delete(lineId)   // ← FALTA ESTE: liberar candado anti-doble-vuelo
+            this.connectingLines?.delete(lineId)   // liberar candado anti-doble-vuelo
             this.connectingLocks.delete(lineId)
 
             // Limpiar timers previos
@@ -305,7 +331,7 @@ setupEvents(waClient, lineId, phone, saveCreds) {
         // ─── 3. EVENTO CERRADO / DESCONECTADO ───
         if (connection === 'close') {
 
-this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la razón
+    this.connectingLines?.delete(lineId)   // LIBERAR SIEMPRE, sea cual sea la razón
 
     // Cierre "limpio" sin error = lo provocamos nosotros (end() manual/force). No reconectar.
     const statusCode = lastDisconnect?.error?.output?.statusCode
@@ -315,40 +341,39 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
         return
     }
 
+     console.log(`[CLOSE] ${lineId} razón=${statusCode} desde:`, new Error().stack?.split('\n').slice(2, 5).join(' | '))
+
     if (this.presenceIntervals[lineId]) {
         clearInterval(this.presenceIntervals[lineId])
         delete this.presenceIntervals[lineId]
     }
 
-    // 401 = sesión invalidada · 403 = sesión rechazada/cuenta baneada → ambos FATALES
     console.log(`[ERR] Disconnect ${lineId} payload:`,
             JSON.stringify(lastDisconnect?.error?.output?.payload || lastDisconnect?.error))
             
+    // 401 = sesión invalidada · 403 = sesión rechazada/cuenta baneada
     const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403
 
     // ─── 440: CONEXIÓN REEMPLAZADA (otra instancia) ───
-    // Esto pasa cuando health check + reconexión automática compiten
     if (statusCode === 440) {
         console.log(`⚠️ Conexión reemplazada (440): ${lineId}. Otra instancia robó la sesión.`)
         
         // Limpiar todo para que este nodo no pelee más
         this.clients.delete(lineId)
         this.sessionHealth.delete(lineId)
-        if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] === 'number') {
+        if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] !== 'string') {
             clearTimeout(this.reconnectTimers[lineId])
         }
         delete this.reconnectTimers[lineId]
         
-        // Limpiar sesión del disco (aunque sea efímero, evita que Baileys lea basura)
+        // Limpiar sesión del disco
         await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
         
-        // Actualizar DB para que el health check no intente reconectar
         await this.prisma.lineas_whatsapp.update({
             where: { id: lineId },
             data: { status: 'DESCONECTADA' }
         }).catch(() => {})
         
-        // Notificar al frontend
         const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
         const payload = { 
             lineId, 
@@ -365,7 +390,7 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
 
     console.log(`❌ Desconectado ${lineId}. Razón: ${statusCode}`)
 
-   // ─── 401: SESIÓN INVALIDADA (logout o expirada) ───
+   // ─── 401/403: SESIÓN INVALIDADA ───
     if (isLoggedOut) {
     this.connectingLines?.delete(lineId)
     this.clients.delete(lineId)
@@ -374,20 +399,73 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
     const payloadMsg = lastDisconnect?.error?.output?.payload?.message || ''
     const isConflict = payloadMsg.includes('conflict') || payloadMsg.includes('replaced')
 
-    if (isConflict) {
-        // ⚠️ CONFLICT: otro stream compitió. Las creds PUEDEN seguir válidas → NO borrar sesión
-        console.log(`⚠️ Conflict en ${lineId} — sesión preservada, reconexión manual disponible`)
-        await this.prisma.lineas_whatsapp.update({
-            where: { id: lineId },
-            data: { status: 'DESCONECTADA' }
-        }).catch(() => {})
+        if (isConflict) {
+            // ⚠️ CONFLICT: Meta cortó el stream. Creds preservadas → auto-reconexión en 30s
+            this.disconnectHistory[lineId] = this.disconnectHistory[lineId] || { count: 0, firstAt: Date.now() }
+            const h = this.disconnectHistory[lineId]
+            h.count++
 
-        const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
-        const payload = { lineId, status: 'DESCONECTADA', reason: 'CONFLICT', phone: maskPhone(phone) }
-        if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
-        else this.io.emit('status', payload)
-        return
-    }
+            console.log(`⚠️ Conflict en ${lineId} (#${h.count}) — sesión preservada, auto-reconexión en 30s`)
+            await this.prisma.lineas_whatsapp.update({
+                where: { id: lineId },
+                data: { status: 'DESCONECTADA' }
+            }).catch(() => {})
+
+            const ownerId = this.lineOwners ? this.lineOwners.get(lineId) : null
+            const payload = { lineId, status: 'DESCONECTADA', reason: 'CONFLICT', phone: maskPhone(phone) }
+            if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
+            else this.io.emit('status', payload)
+
+            // ─── AUTO-RECONEXIÓN con tope de 5 intentos por hora (anti-loop) ───
+            const unaHora = 3600000
+            if (Date.now() - h.firstAt > unaHora) { h.count = 1; h.firstAt = Date.now() } // reset ventana
+
+            if (h.count <= 5) {
+                if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] !== 'string') {
+                    clearTimeout(this.reconnectTimers[lineId])
+                }
+                this.reconnectTimers[lineId] = setTimeout(() => {
+                    if (this.reconnectTimers[lineId] === 'CANCELLED' || this.reconnectTimers[lineId] === 'REVOKED') {
+                        console.log(`⏹️ Auto-reconexión post-conflict abortada (${this.reconnectTimers[lineId]}): ${lineId}`)
+                        return
+                    }
+                    // NO miramos campaignActive: si la campaña está en pausa inteligente,
+                    // está ESPERANDO esta reconexión para continuar
+                    console.log(`🔄 Auto-reconexión post-conflict (intento ${h.count}/5): ${lineId}`)
+                    this.connect(phone).catch(e => console.error(`❌ Auto-reconexión falló ${lineId}:`, e.message))
+                }, 30000) // 30s: sweet spot para que Meta suelte el stream
+
+                // 🩺 Avisar al panel: reconexión automática en curso
+                try {
+                    if (this.io && ownerId) {
+                        this.io.emitToUser(ownerId, 'campaign_log', {
+                            campaignId: null,
+                            status: 'paused',
+                            progress: '🩺',
+                            phone: '',
+                            linePhone: phone,
+                            error: `Línea restringida por WhatsApp — reconexión automática en 30s (intento ${h.count}/5)`
+                        })
+                    }
+                } catch {}
+            } else {
+                console.log(`🛑 5 conflicts en una hora para ${lineId} — reconexión manual requerida`)
+                // 🩺 Avisar al panel: se agotó el autosanador
+                try {
+                    if (this.io && ownerId) {
+                        this.io.emitToUser(ownerId, 'campaign_log', {
+                            campaignId: null,
+                            status: 'paused',
+                            progress: '🛑',
+                            phone: '',
+                            linePhone: phone,
+                            error: 'Límite de auto-reconexiones alcanzado (5/hora) — reconectá la línea manualmente desde el panel'
+                        })
+                    }
+                } catch {}
+            }
+            return
+        }
 
     // 🔒 Logout real (device_removed / baneo): recién acá borramos
     console.log(`🔒 Sesión revocada por Meta: ${lineId}`)
@@ -429,13 +507,18 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
         return
     }
 
+    if (this.campaignActive.get(lineId)) {
+        console.log(`⛔ Campaña activa en ${lineId} — no se programa reconexión, la campaña gestiona la caída`)
+        this.clients.delete(lineId)
+        return
+    }
+
     // ─── RECONEXIÓN AUTOMÁTICA (fallas de red temporales) ───
-     // ─── RECONEXIÓN AUTOMÁTICA (fallas de red temporales) ───
     console.log(`🔄 Reconexión temporal ${lineId}...`)
     this.clients.delete(lineId)
 
     // Anti-duplicado: si ya hay un timer corriendo, no crear otro
-    if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] === 'number') {
+    if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] !== 'string') {
         clearTimeout(this.reconnectTimers[lineId])
     }
 
@@ -452,13 +535,13 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
 }
     })
 
-    // ─── MENSAJES (Mantenemos tu lógica de upsert intacta) ───
+    // ─── MENSAJES ENTRANTES ───
     waClient.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return
         for (const msg of messages) {
             if (!msg.message) continue
             const remoteJid = msg.key.remoteJid || ''
-  if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast')) continue
+            if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast')) continue
             const messageBody = msg.message?.conversation || msg.message?.extendedTextMessage?.text || ''
             const raw = msg.key.remoteJid
             const alt = msg.key.remoteJidAlt
@@ -498,20 +581,17 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
                 this._setLidCache(`${lineId}:${lidDetectado}`, fromPhone)
             }
 
-            // ─── 1. LÓGICA DE BLACKLIST MANUAL (Operador Ninja) ───
+            // ─── 1. BLACKLIST MANUAL (Operador Ninja) ───
             if (msg.key.fromMe) {
                 const cmd = messageBody.trim().toLowerCase()
                 let reason = null
 
-                // A. Modo Rápido: El operador manda solo un emoji de bloqueo
                 if (['🚫', '⛔', '🔇'].includes(cmd)) {
                     reason = 'bloqueo_rapido_emoji'
                 }
-                // B. Modo Educado: El operador usa una frase natural, el cliente la lee, y el sistema actúa
                 else if (cmd.includes('te doy de baja') || cmd.includes('te elimino de la base') || cmd.includes('no te escribimos más') || cmd.includes('te borro de la lista')) {
                     reason = 'baja_amable_operador'
                 }
-                // C. Modo Etiquetado Silencioso: Usar un punto al final para disimular (ej: "falso.")
                 else if (cmd === '.falso' || cmd === 'falso.') reason = 'comprobante falso'
                 else if (cmd === '.spam' || cmd === 'spam.') reason = 'spam'
                 else if (cmd === '.estafa' || cmd === 'estafa.') reason = 'estafa'
@@ -551,29 +631,27 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
                         console.error('Operator blacklist error:', e)
                     }
                 }
+                if (!reason) {
+    // Mensaje humano real desde el celular → alimenta el semáforo de salud
+    this._trackLineActivity(lineId, 'human_msgs_out')
+}
                 continue
             }
 
-            // ─── 2. AUTO-BLACKLIST POR KEYWORDS (La Cúpula de Hierro) ───
+            // ─── 2. AUTO-BLACKLIST POR KEYWORDS ───
             try {
+               this._trackLineActivity(lineId, 'msgs_in')
                 const config = await this.prisma.app_config.findUnique({ where: { key: 'blacklist_keywords' } })
                 
-                // Diccionario pesado de contingencia
                 const defaultKeywords = [
-                    // Educados
                     'no me interesa', 'no gracias', 'no, gracias', 'no quiero', 'paso,', 'paso gracias',
-                    // Directos
                     'basta', 'stop', 'darme de baja', 'eliminar', 'no mandes', 'no escribas', 'sacame de', 'borrame', 'desuscribir', 'bloquear', 'denunciar',
-                    // Enojados / Modismos (Argentina/LatAm)
                     'romper las bolas', 'rompiendo las bolas', 'hinchar los huevos', 'hinchando los huevos', 'no jodan', 'dejen de joder', 'no me jodas', 'vayanse a cagar', 'váyanse a cagar', 'pesados', 'harto', 'cansado', 'pelotudos', 'quien te paso', 'quien les paso', 'de donde sacaste', 'metete el',
-                    // Emojis de rechazo
                     '🖕', '🛑', '🚫'
                 ]
                 
                 const keywords = config?.value ? JSON.parse(config.value) : defaultKeywords
                 const lowerBody = messageBody.toLowerCase()
-                
-                // Buscamos si alguna keyword coincide dentro del texto del cliente
                 const matched = keywords.find(k => lowerBody.includes(k.toLowerCase()))
                 
                 if (matched) {
@@ -601,7 +679,7 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
                 console.error('Auto-blacklist error:', e)
             }
 
-            // Reporte de respuestas
+            // ─── 3. REPORTE DE RESPUESTAS ───
             try {
                 const recentLog = await this.prisma.campaign_logs.findFirst({
                     where: {
@@ -616,6 +694,7 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
                         where: { id: recentLog.id },
                         data: { has_reply: true, replied_at: new Date() }
                     })
+                    this._trackLineActivity(lineId, 'replies')
                     const ownerId = recentLog.owner_id || null
                     const payload = { 
                         campaign_id: recentLog.campaign_id, 
@@ -635,12 +714,23 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
         }
     })
 
-    // ─── MESSAGES.UPDATE (Lectura / Entregado) ───
+    // ─── MESSAGES.UPDATE (ACK: Entregado / Leído) ───
+        // ─── MESSAGES.UPDATE (ACK: Entregado / Leído) ───
     waClient.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
             const { key, update: statusUpdate } = update
             if (!key.id || !key.remoteJid) continue
-            
+
+            const ack = statusUpdate?.status || statusUpdate?.ack
+
+            // 🩺 Confirmación de entrega en vivo: sendCampaign puede estar esperando este ACK
+            if (ack >= 2 && this.pendingAcks?.has(key.id)) {
+                const pending = this.pendingAcks.get(key.id)
+                clearTimeout(pending.timeout)
+                pending.resolve(true)
+                this.pendingAcks.delete(key.id)
+            }
+
             if (key.remoteJid.includes('@lid')) {
                 const lidClean = key.remoteJid.split('@')[0]
                 if (!this.lidCache.has(`${lineId}:${lidClean}`)) {
@@ -664,14 +754,13 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
             }
             const phone = await this.resolvePhoneFromJid(lineId, key.remoteJid)
             if (!phone) continue
-            
+
             const log = await this.prisma.campaign_logs.findFirst({
                 where: { contact_phone: phone, message_id: key.id },
                 orderBy: { created_at: 'desc' }
             })
             if (!log) continue
-            
-            const ack = statusUpdate?.status || statusUpdate?.ack
+
             if (ack === 2 && !log.delivered_at) {
                 await this.prisma.campaign_logs.update({
                     where: { id: log.id },
@@ -699,7 +788,7 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
             await this._storeLidMappingFromContact(lineId, update).catch(() => {})
         }
     })
-  }
+}
 
   cleanJid(jid) {
     if (!jid) return ''
@@ -775,64 +864,57 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
     return null
   }
 
-  async sendMessage(lineId, contactPhone, content, options = {}) {
+    async sendMessage(lineId, contactPhone, content, options = {}) {
     const { type = 'text', imageUrl = null } = options
     let waClient = this.clients.get(lineId) || this.clients.get(String(lineId))
     if (!waClient || !waClient.user) throw new Error('Línea no conectada')
     try {
-            const cleanNumber = this.cleanJid(contactPhone)
+      const cleanNumber = this.cleanJid(contactPhone)
       const isGroup = cleanNumber.length > 15
-      let jid = isGroup ? `${cleanNumber}@g.us` : `${cleanNumber}@s.whatsapp.net`
+      // ✅ SIEMPRE al PN: es el camino probado que entrega en todas las versiones.
+      // El @lid queda prohibido como destino de salida (ghost sends en rc13, conflicts en rc9)
+      const jid = isGroup ? `${cleanNumber}@g.us` : `${cleanNumber}@s.whatsapp.net`
 
-      // ─── RESOLVER JID REAL (Evita mensajes fantasma) ───
+      // ─── VERIFICACIÓN DE EXISTENCIA (no cambia el destino, solo valida) ───
       if (!isGroup) {
         try {
-          // 1. ¿Ya tenemos el mapeo en caché/DB?
-          const known = await this.prisma.lid_mappings.findFirst({
-            where: { lineId, phone: cleanNumber }
-          })
-          
-          if (known?.lid) {
-            jid = `${known.lid}@lid`
-          } else {
-            // 2. Método nativo e infalible de Baileys
-            console.log(`🔍 Verificando número en WhatsApp: ${cleanNumber}...`)
-            const [result] = await waClient.onWhatsApp(cleanNumber)
-            
-                        if (result && result.exists) {
-              jid = result.jid
-              console.log(`✅ JID exacto resuelto por Meta: ${jid}`)
-              if (jid.includes('@lid')) {   // ← opcional: persistir para no re-consultar
-                const lidClean = jid.split('@')[0]
-                this._setLidCache(`${lineId}:${lidClean}`, cleanNumber)
-                await this.prisma.lid_mappings.upsert({
-                  where: { lineId_lid: { lineId, lid: lidClean } },
-                  update: { phone: cleanNumber, updatedAt: new Date() },
-                  create: { lineId, lid: lidClean, phone: cleanNumber }
-                }).catch(() => {})
-              }
-            } else {
-              console.log(`⚠️ El número ${cleanNumber} no tiene WhatsApp.`)
-              throw new Error('El número no existe en WhatsApp')
+          console.log(`🔍 Verificando número en WhatsApp: ${cleanNumber}...`)
+          const result = (await waClient.onWhatsApp(cleanNumber))?.[0]
+
+          if (result && result.exists) {
+            console.log(`✅ Número verificado en WhatsApp`)
+            // Si Meta nos devuelve su LID, lo guardamos SOLO para lectura
+            // (resolver respuestas entrantes), NO para enviar
+            if (result.jid?.includes('@lid')) {
+              const lidClean = result.jid.split('@')[0]
+              this._setLidCache(`${lineId}:${lidClean}`, cleanNumber)
+              await this.prisma.lid_mappings.upsert({
+                where: { lineId_lid: { lineId, lid: lidClean } },
+                update: { phone: cleanNumber, updatedAt: new Date() },
+                create: { lineId, lid: lidClean, phone: cleanNumber }
+              }).catch(() => {})
             }
+          } else {
+            console.log(`⚠️ El número ${cleanNumber} no tiene WhatsApp.`)
+            throw new Error('El número no existe en WhatsApp')
           }
         } catch (e) {
-          if (e.message === 'El número no existe en WhatsApp') throw e;
-          console.warn(`⚠️ Error consultando onWhatsApp para ${cleanNumber}, usando fallback:`, e.message)
+          if (e.message === 'El número no existe en WhatsApp') throw e
+          console.warn(`⚠️ onWhatsApp falló para ${cleanNumber}, envío igual al PN:`, e.message)
         }
       }
 
-      if (!isGroup) {
+      // ─── WARM-UP DEL TÚNEL (primer contacto) ───
+      if (!isGroup && !options.skipWarmup) {
           try {
               console.log(`🔥 Calentando túnel criptográfico para ${jid}...`)
               await waClient.presenceSubscribe(jid)
               await waClient.profilePictureUrl(jid).catch(() => {})
-              await new Promise(r => setTimeout(r, 600)) // Micro-pausa vital para que Meta sincronice
+              await new Promise(r => setTimeout(r, 600))
           } catch (e) {
               console.log(`⚠️ Warm-up silencioso (ignorar): ${e.message}`)
           }
       }
-
 
       let messagePayload = {}
       if (type === 'image' && imageUrl) {
@@ -841,12 +923,13 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
         messagePayload = { text: content }
       }
       const sentMsg = await waClient.sendMessage(jid, messagePayload)
-      
+
       // Guardar el protocolo nativo para que Baileys pueda reenviarlo si el destinatario pide retry
       if (sentMsg?.key?.id && sentMsg.message) {
           this.outgoingMessagesCache.set(sentMsg.key.id, sentMsg.message)
       }
 
+      // Captura de LID (solo registro/lectura — nunca se usa para enviar)
       if (sentMsg?.key?.remoteJid?.includes('@lid')) {
         const lid = sentMsg.key.remoteJid.split('@')[0]
         this._setLidCache(`${lineId}:${lid}`, cleanNumber)
@@ -855,7 +938,7 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
           update: { phone: cleanNumber, updatedAt: new Date() },
           create: { lineId, lid, phone: cleanNumber }
         }).catch(() => {})
-        console.log(`🔗 LID capturado al enviar: ${lid} → ${maskPhone(cleanNumber)}`)
+        console.log(`🔗 LID registrado (solo lectura): ${lid} → ${maskPhone(cleanNumber)}`)
       }
       return { success: true, messageId: sentMsg?.key?.id }
     } catch (error) {
@@ -866,14 +949,14 @@ this.connectingLines?.delete(lineId)   // ← LIBERAR SIEMPRE, sea cual sea la r
 
 
 
-  async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
+    async sendCampaign(campaignId, lineInput, targets, message, options = {}) {
   // 🔐 INLINE LICENSE CHECK
   const licenseConfig = await this.prisma.app_config.findUnique({ where: { key: 'license' } })
   if (!licenseConfig?.value) throw new Error('LICENSE_REQUIRED')
   const license = this.validateLicense(licenseConfig.value)
   if (!license) throw new Error('LICENSE_INVALID')
 
-if (options.imageUrl && license.tier === 'starter') throw new Error('TIER_UPGRADE_REQUIRED')
+  if (options.imageUrl && license.tier === 'starter') throw new Error('TIER_UPGRADE_REQUIRED')
 
   // Defaults conservadores (15-25s) para evitar bans
   let { delayMin = 15000, delayMax = 25000, imageUrl = null } = options
@@ -899,7 +982,7 @@ if (options.imageUrl && license.tier === 'starter') throw new Error('TIER_UPGRAD
     if (lineInput.status === 'CONECTADA' && client && client.user) lineasActivas = [lineInput]
   }
 
-    if (lineasActivas.length === 0) {
+  if (lineasActivas.length === 0) {
     throw new Error('No hay líneas conectadas y autenticadas disponibles para enviar')
   }
 
@@ -923,7 +1006,9 @@ if (options.imageUrl && license.tier === 'starter') throw new Error('TIER_UPGRAD
   let wasCancelled = false
   let lineaIndex = 0
   const lineasCaidas = new Set()
+  const fallosConsecutivos = new Map()
   let lastDelayMs = 0
+  let ghostStreak = 0
 
   try {
     for (let i = 0; i < targets.length; i++) {
@@ -934,26 +1019,27 @@ if (options.imageUrl && license.tier === 'starter') throw new Error('TIER_UPGRAD
         continue
       }
 
-      const shouldCheckBlacklist = options.skipBlacklist !== false
-if (shouldCheckBlacklist) {
-  const cleanPhone = target.phone.replace(/\D/g, '')
-  const blacklisted = await this.prisma.blacklist.findFirst({
-    where: { phone: cleanPhone }
-  })
-  if (blacklisted) {
-    console.log(`⛔ Saltando ${maskPhone(target.phone)} — blacklist (reason: ${blacklisted.reason})`)
-    await this.prisma.campaign_logs.create({
-      data: {
-        campaign_id: campaignId,
-        contact_phone: target.phone,
-        status: 'skipped_blacklist',
-        line_id: null,
-        owner_id: options.ownerId || null,
+      // skipBlacklist === true → el operador pidió OMITIR el filtro (tier-gated en front)
+      const shouldCheckBlacklist = options.skipBlacklist !== true
+      if (shouldCheckBlacklist) {
+        const cleanPhone = target.phone.replace(/\D/g, '')
+        const blacklisted = await this.prisma.blacklist.findFirst({
+          where: { phone: cleanPhone }
+        })
+        if (blacklisted) {
+          console.log(`⛔ Saltando ${maskPhone(target.phone)} — blacklist (reason: ${blacklisted.reason})`)
+          await this.prisma.campaign_logs.create({
+            data: {
+              campaign_id: campaignId,
+              contact_phone: target.phone,
+              status: 'skipped_blacklist',
+              line_id: null,
+              owner_id: options.ownerId || null,
+            }
+          }).catch(() => {})
+          continue
+        }
       }
-    }).catch(() => {})
-    continue
-  }
-}
 
       try {
         const campaignStatus = await this.prisma.campaigns.findUnique({
@@ -967,6 +1053,7 @@ if (shouldCheckBlacklist) {
         }
       } catch (e) {}
 
+      // ─── ASIGNACIÓN DE LÍNEA (round-robin, saltando caídas) ───
       let intentos = 0
       let lineaAsignada = null
       while (intentos < lineasActivas.length) {
@@ -1010,14 +1097,57 @@ if (shouldCheckBlacklist) {
         continue
       }
 
+      // ─── PAUSA INTELIGENTE: esperar al autosanador si el socket cayó ───
       const waClientCheck = this.clients.get(lineaAsignada.id)
+
       if (!waClientCheck || !waClientCheck.user) {
-        lineasCaidas.add(lineaAsignada.id)
-        i--
+        let fallos = (fallosConsecutivos.get(lineaAsignada.id) || 0) + 1
+        fallosConsecutivos.set(lineaAsignada.id, fallos)
+
+        if (fallos > 6) { // 6 × 10s = 60s de tolerancia (autosanador tarda ~30s)
+          console.log(`🛑 Línea ${lineaAsignada.phone} no revivió tras 60s — se da por caída`)
+          lineasCaidas.add(lineaAsignada.id)
+        } else {
+          // 🩺 Avisar al panel que la campaña está en pausa esperando al autosanador
+          try {
+            const ownerId = options.ownerId || null
+            if (this.io && ownerId) {
+              this.io.emitToUser(ownerId, 'campaign_log', {
+                campaignId, campaign_id: campaignId,
+                status: 'paused',
+                progress: `${i + 1}/${targets.length}`,
+                phone: target.phone,
+                linePhone: lineaAsignada.phone || '',
+                error: `Campaña en pausa — reconectando línea por restricción de WhatsApp (${fallos}/6)`
+              })
+            }
+          } catch {}
+          console.log(`⏳ Campaña en pausa 10s — esperando auto-sanación de ${lineaAsignada.phone} (${fallos}/6)`)
+          await new Promise(r => setTimeout(r, 10000))
+        }
+        i-- // reintentar el MISMO contacto
         continue
       }
 
+      // 🩺 Socket vivo: si veníamos de una pausa (fallos > 0), avisar reanudación
+      if ((fallosConsecutivos.get(lineaAsignada.id) || 0) > 0) {
+        try {
+          const ownerId = options.ownerId || null
+          if (this.io && ownerId) {
+            this.io.emitToUser(ownerId, 'campaign_log', {
+              campaignId, campaign_id: campaignId,
+              status: 'resumed',
+              progress: `${i + 1}/${targets.length}`,
+              phone: target.phone,
+              linePhone: lineaAsignada.phone || '',
+              error: 'Línea reconectada — reanudando envíos'
+            })
+          }
+        } catch {}
+      }
+
       try {
+        fallosConsecutivos.set(lineaAsignada.id, 0)
         const resolvedMessage = resolveSpintax(message)
         const personalized = resolvedMessage
           .replace(/\{\{nombre\}\}/gi, target.name || 'Cliente')
@@ -1025,7 +1155,11 @@ if (shouldCheckBlacklist) {
           .replace(/\{\{telefono\}\}/gi, target.phone || '')
           .replace(/\{telefono\}/gi, target.phone || '')
 
-        const sendOptions = { type: imageUrl ? 'image' : 'text', imageUrl }
+        const sendOptions = {
+          type: options.type || 'text',
+          imageUrl: options.imageUrl || null,
+          skipWarmup: true   // ⏸️ TEMPORAL (diagnóstico): desactivar warm-up de túnel
+        }
         let sendResult
         if (options.humanMode) {
           sendResult = await this.sendMessageHuman(lineaAsignada.id, target.phone, personalized, sendOptions)
@@ -1033,7 +1167,24 @@ if (shouldCheckBlacklist) {
           sendResult = await this.sendMessage(lineaAsignada.id, target.phone, personalized, sendOptions)
         }
 
-        const exactMessageId = sendResult?.messageId
+                const exactMessageId = sendResult?.messageId
+
+        // 🩺 CONFIRMACIÓN DE ENTREGA REAL: esperar el ACK de Meta (máx 12s)
+        // Verde = el dispositivo destinatario confirmó recepción.
+        // Amarillo = Meta aceptó pero no confirmó → retención por políticas o destinatario offline.
+        let entregaConfirmada = false
+        if (exactMessageId) {
+          entregaConfirmada = await new Promise((resolve) => {
+            const timeout = setTimeout(() => {
+              this.pendingAcks.delete(exactMessageId)
+              resolve(false)
+            }, options.ackTimeoutMs || 12000)
+            this.pendingAcks.set(exactMessageId, { resolve, timeout })
+          })
+        }
+
+
+        
 
         await this.prisma.campaign_logs.create({
           data: {
@@ -1051,7 +1202,7 @@ if (shouldCheckBlacklist) {
           data: { sent: { increment: 1 } }
         }).catch(e => console.error(`[DB] Error incrementando sent:`, e.message))
 
-        results.push({ phone: target.phone, status: 'sent', lineId: lineaAsignada.id, index: i })
+        results.push({ phone: target.phone, status: 'sent', lineId: lineaAsignada.id, index: i, unconfirmed: !entregaConfirmada })
 
         const ownerId = options.ownerId || null
         const payload = {
@@ -1059,13 +1210,14 @@ if (shouldCheckBlacklist) {
           campaign_id: campaignId,
           phone: target.phone,
           contact_phone: target.phone,
-          status: 'sent',
+          status: entregaConfirmada ? 'sent' : 'unconfirmed',
           lineId: lineaAsignada.id,
           line_id: lineaAsignada.id,
           linePhone: lineaAsignada.phone,
           delayMs: lastDelayMs,
           line_phone: lineaAsignada.phone,
-          progress: `${i + 1}/${targets.length}`
+          progress: `${i + 1}/${targets.length}`,
+          ...(entregaConfirmada ? {} : { error: 'Meta retuvo este mensaje (política anti-spam) o el destinatario está sin conexión — no reenviar todavía' })
         }
         if (ownerId && this.io.emitToUser) {
           this.io.emitToUser(ownerId, 'campaign_log', payload)
@@ -1073,17 +1225,88 @@ if (shouldCheckBlacklist) {
           this.io.emit('campaign_log', payload)
         }
 
-        console.log(`✅ ${i + 1}/${targets.length} → ${maskPhone(target.phone)} [${maskPhone(lineaAsignada.phone)}]`)
+        if (entregaConfirmada) {
+          console.log(`✅ ${i + 1}/${targets.length} → ${maskPhone(target.phone)} [${maskPhone(lineaAsignada.phone)}] entrega confirmada`)
+        } else {
+          console.log(`⚠️ ${i + 1}/${targets.length} → ${maskPhone(target.phone)} [${maskPhone(lineaAsignada.phone)}] SIN CONFIRMAR — retenido por Meta u offline`)
+        }
+
+
+        ghostStreak = entregaConfirmada ? 0 : ghostStreak + 1
+        if (ghostStreak >= 2) {
+          console.log(`🛑 2 mensajes retenidos seguidos en ${lineaAsignada.phone} — Meta está filtrando. Frenando campaña para proteger la línea.`)
+          try {
+            const ownerIdFreno = options.ownerId || null
+            if (this.io && ownerIdFreno) {
+              this.io.emitToUser(ownerIdFreno, 'campaign_log', {
+                campaignId, campaign_id: campaignId,
+                status: 'paused',
+                progress: `${i + 1}/${targets.length}`,
+                phone: target.phone,
+                linePhone: lineaAsignada.phone || '',
+                error: '⛔ Meta está reteniendo los mensajes de esta línea. Campaña frenada automáticamente para proteger el número — esperá 24-48hs de uso normal antes de reintentar'
+              })
+            }
+          } catch {}
+          wasCancelled = true
+          break
+        }
+
+        
         lineaIndex++
 
       } catch (err) {
-        console.error(`❌ ${maskPhone(target.phone)} [${maskPhone(lineaAsignada.phone)}]:`, err.message)
-        lineasCaidas.add(lineaAsignada.id)
+        // ⛔ Errores DEFINITIVOS: no reintentar, marcar failed directo
+        const esDefinitivo = err.message?.includes('no existe en WhatsApp')
+        if (esDefinitivo) {
+          console.error(`❌ Número inválido (sin retry): ${maskPhone(target.phone)}`)
+          await this.prisma.campaigns.update({
+            where: { id: campaignId },
+            data: { failed: { increment: 1 } }
+          }).catch(() => {})
+          results.push({ phone: target.phone, status: 'failed', lineId: lineaAsignada.id, index: i })
 
-        await this.prisma.campaigns.update({
-          where: { id: campaignId },
-          data: { failed: { increment: 1 } }
-        }).catch(() => {})
+          await this.prisma.campaign_logs.create({
+            data: {
+              campaign_id: campaignId,
+              line_id: lineaAsignada.id,
+              contact_phone: target.phone,
+              status: 'failed',
+              error: 'El número no existe en WhatsApp',
+              owner_id: options.ownerId || null,
+            }
+          }).catch(() => {})
+
+          const invalidPayload = {
+            campaignId: campaignId, campaign_id: campaignId,
+            phone: target.phone, contact_phone: target.phone,
+            status: 'failed', lineId: lineaAsignada.id, line_id: lineaAsignada.id,
+            linePhone: lineaAsignada.phone, line_phone: lineaAsignada.phone,
+            delayMs: lastDelayMs, error: 'no existe en WhatsApp',
+            progress: `${i + 1}/${targets.length}`
+          }
+          if (options.ownerId && this.io.emitToUser) {
+            this.io.emitToUser(options.ownerId, 'campaign_log', invalidPayload)
+          } else {
+            this.io.emit('campaign_log', invalidPayload)
+          }
+          continue
+        }
+
+        // 🩺 Error de socket/red: pausa inteligente y retry del mismo contacto
+        let fallos = (fallosConsecutivos.get(lineaAsignada.id) || 0) + 1
+        fallosConsecutivos.set(lineaAsignada.id, fallos)
+
+        if (fallos <= 6) {
+          console.log(`⏳ Error de envío a ${maskPhone(target.phone)} — posible corte Meta, pausa 10s (${fallos}/6)`)
+          await new Promise(r => setTimeout(r, 10000))
+          i--
+          continue
+        }
+
+        // Ya esperamos 60s: falla definitiva de línea
+        console.error(`❌ Fallo definitivo ${maskPhone(target.phone)}:`, err.message)
+        lineasCaidas.add(lineaAsignada.id)
 
         const failPayload = {
           campaignId: campaignId,
@@ -1191,6 +1414,7 @@ if (shouldCheckBlacklist) {
   const completePayload = {
     campaignId: campaignId,
     campaign_id: campaignId,
+    unconfirmed: results.filter(r => r.unconfirmed).length,
     status: finalStatus,
     sent: results.filter(r => r.status === 'sent').length,
     failed: results.filter(r => r.status === 'failed').length,
