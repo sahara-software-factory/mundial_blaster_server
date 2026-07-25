@@ -632,8 +632,10 @@ setupEvents(waClient, lineId, phone, saveCreds) {
                     }
                 }
                 if (!reason) {
-    // Mensaje humano real desde el celular → alimenta el semáforo de salud
-    this._trackLineActivity(lineId, 'human_msgs_out')
+    const enviadoPorApi = this.outgoingMessagesCache?.get(msg.key.id)
+    if (!enviadoPorApi) {
+        this._trackLineActivity(lineId, 'human_msgs_out')
+    }
 }
                 continue
             }
