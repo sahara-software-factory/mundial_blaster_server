@@ -159,13 +159,25 @@ async connect(phone, options = {}) {
            // Socket previo: si está VIVO, reutilizar — jamás matar una sesión sana
     const existing = this.clients.get(lineId)
     if (existing) {
-      const isAlive = !!existing.user || existing?.ws?.readyState === 1
+      const wsState = existing?.ws?.readyState
+const isAlive = wsState === 1 || (!!existing.user && (wsState === undefined || wsState === 0))
       if (isAlive) {
-        console.log(`✅ Socket ya vivo para ${lineId} — se reutiliza, no se toca`)
-        this.connectingLines?.delete(lineId)
-        this.connectingLocks.delete(lineId)
-        return line
-      }
+    console.log(`✅ Socket ya vivo para ${lineId} — se reutiliza, no se toca`)
+    this.connectingLines?.delete(lineId)
+    this.connectingLocks.delete(lineId)
+
+    // 🔄 Sincronizar: el panel/DB puede haber quedado desfasado (post-440, redeploy, etc.)
+    await this.prisma.lineas_whatsapp.update({
+        where: { id: lineId },
+        data: { status: 'CONECTADA' }
+    }).catch(() => {})
+    const ownerId = line.owner_id || line.userId || line.user_id
+    const payloadSync = { lineId, status: 'CONECTADA', phone: maskPhone(phone) }
+    if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payloadSync)
+    else this.io.emit('status', payloadSync)
+
+    return line
+}
 
       if (this.campaignActive.get(lineId)) {
         const existing = this.clients.get(lineId)
@@ -338,7 +350,8 @@ setupEvents(waClient, lineId, phone, saveCreds) {
 
     if (!statusCode) {
         console.log(`⏹️ Cierre sin código (manual/propio): ${lineId}`)
-        return
+       if (this.clients.get(lineId) === waClient) this.clients.delete(lineId)
+    return
     }
 
      console.log(`[CLOSE] ${lineId} razón=${statusCode} desde:`, new Error().stack?.split('\n').slice(2, 5).join(' | '))
@@ -354,11 +367,16 @@ setupEvents(waClient, lineId, phone, saveCreds) {
     // 401 = sesión invalidada · 403 = sesión rechazada/cuenta baneada
     const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403
 
-    // ─── 440: CONEXIÓN REEMPLAZADA (otra instancia) ───
+     // ─── 440: CONEXIÓN REEMPLAZADA (otra instancia) ───
     if (statusCode === 440) {
         console.log(`⚠️ Conexión reemplazada (440): ${lineId}. Otra instancia robó la sesión.`)
         
-        // Limpiar todo para que este nodo no pelee más
+        // 🔪 Matar el socket zombie ANTES de borrarlo del mapa — si queda vivo, pelea con el próximo
+        const zombie = this.clients.get(lineId)
+        if (zombie) {
+            try { zombie.ev.removeAllListeners() } catch {}
+            try { zombie.end(undefined) } catch {}
+        }
         this.clients.delete(lineId)
         this.sessionHealth.delete(lineId)
         if (this.reconnectTimers[lineId] && typeof this.reconnectTimers[lineId] !== 'string') {
@@ -366,7 +384,7 @@ setupEvents(waClient, lineId, phone, saveCreds) {
         }
         delete this.reconnectTimers[lineId]
         
-        // Limpiar sesión del disco
+        // Limpiar sesión del disco (efímero — Neon NO se toca)
         await fs.remove(path.join(this.sessionsDir, String(lineId))).catch(() => {})
         
         await this.prisma.lineas_whatsapp.update({
@@ -384,6 +402,13 @@ setupEvents(waClient, lineId, phone, saveCreds) {
         }
         if (ownerId && this.io.emitToUser) this.io.emitToUser(ownerId, 'status', payload)
         else this.io.emit('status', payload)
+
+        // 🔄 Reintento suave post-440: el overlap de redeploy muere solo en <1 min
+        this.reconnectTimers[lineId] = setTimeout(() => {
+            if (this.reconnectTimers[lineId] === 'CANCELLED' || this.reconnectTimers[lineId] === 'REVOKED') return
+            console.log(`🔄 Reintento suave post-440 (overlap de instancia): ${lineId}`)
+            this.connect(phone).catch(e => console.error(`❌ Reintento 440 falló ${lineId}:`, e.message))
+        }, 45000)
         
         return
     }
@@ -508,10 +533,8 @@ setupEvents(waClient, lineId, phone, saveCreds) {
     }
 
     if (this.campaignActive.get(lineId)) {
-        console.log(`⛔ Campaña activa en ${lineId} — no se programa reconexión, la campaña gestiona la caída`)
-        this.clients.delete(lineId)
-        return
-    }
+        console.log(`🩺 Campaña activa pero socket muerto en ${lineId} — autosanador permitido`)
+      }
 
     // ─── RECONEXIÓN AUTOMÁTICA (fallas de red temporales) ───
     console.log(`🔄 Reconexión temporal ${lineId}...`)
